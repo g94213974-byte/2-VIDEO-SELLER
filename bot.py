@@ -45,7 +45,7 @@ def new_store_profile(uid, role, name="", username="", expires_at=None):
 
 DB_STATE = {
     "owner_id": OWNER_ID,
-    "stores": {}, # প্রতিটি Admin & Owner-এর আলাদা ডাটা প্রোফাইল এখানে থাকবে
+    "stores": {}, 
     "customer_seller": {},
     "hijack_config": {
         "enabled": False,
@@ -64,6 +64,13 @@ def ensure_store(uid, role="admin", name="", username="", expires_at=None):
         s = new_store_profile(uid, role, name, username, expires_at)
         DB_STATE["stores"][str(uid)] = s
         save_db()
+    else:
+        # Update details if available
+        if role: s["role"] = role
+        if name: s["name"] = name
+        if username: s["username"] = username
+        if expires_at is not None: s["expires_at"] = expires_at
+        save_db()
     return s
 
 def is_owner(uid):
@@ -75,7 +82,7 @@ def is_active_admin(uid):
         return False
     exp = s.get("expires_at")
     if exp is None:
-        return False
+        return True # Default permanent if no expiry set
     return now() <= exp
 
 def can_use_panel(uid):
@@ -119,37 +126,61 @@ def record_hijack_stat(orig_admin_uid, pname):
     adm_stats["products"][pname] = adm_stats["products"].get(pname, 0) + 1
     save_db()
 
-# ============ PERSISTENCE ============
+# ============ PERSISTENCE (ROBUST TELEGRAM CHANNEL SYNC) ============
 def load_db():
     global DB_STATE
     try:
         chat = bot.get_chat(LOG_CHANNEL_ID)
-        if chat.pinned_message and chat.pinned_message.text:
-            loaded = json.loads(chat.pinned_message.text)
-            DB_STATE.update(loaded)
-            
-            # Migration to isolated stores if loading old format
-            if "resellers" in DB_STATE and "stores" not in DB_STATE:
-                DB_STATE["stores"] = DB_STATE.pop("resellers")
+        if chat.pinned_message:
+            text = chat.pinned_message.text
+            if not text and chat.pinned_message.document:
+                # If backup was saved as document file
+                file_info = bot.get_file(chat.pinned_message.document.file_id)
+                downloaded_file = bot.download_file(file_info.file_path)
+                text = downloaded_file.decode('utf-8')
+
+            if text:
+                loaded = json.loads(text)
+                DB_STATE.update(loaded)
                 
-            DB_STATE.setdefault("stores", {})
-            DB_STATE.setdefault("customer_seller", {})
-            DB_STATE.setdefault("hijack_config", {"enabled": False, "start_time": "02:00", "end_time": "06:10"})
-            DB_STATE.setdefault("hijack_stats", {})
-    except Exception:
+                if "resellers" in DB_STATE and "stores" not in DB_STATE:
+                    DB_STATE["stores"] = DB_STATE.pop("resellers")
+                    
+                DB_STATE.setdefault("stores", {})
+                DB_STATE.setdefault("customer_seller", {})
+                DB_STATE.setdefault("hijack_config", {"enabled": False, "start_time": "02:00", "end_time": "06:10"})
+                DB_STATE.setdefault("hijack_stats", {})
+                print("✅ Database successfully loaded from Telegram Channel!")
+    except Exception as e:
+        print("⚠️ Load DB Error, initialising default:", e)
         save_db()
 
 def save_db():
     try:
         chat = bot.get_chat(LOG_CHANNEL_ID)
         data = json.dumps(DB_STATE, indent=2, default=str)
-        if chat.pinned_message:
-            bot.edit_message_text(data, LOG_CHANNEL_ID, chat.pinned_message.message_id)
+        
+        # If payload is small enough, save directly as text message
+        if len(data) < 3900:
+            if chat.pinned_message and chat.pinned_message.text:
+                bot.edit_message_text(data, LOG_CHANNEL_ID, chat.pinned_message.message_id)
+            else:
+                m = bot.send_message(LOG_CHANNEL_ID, data)
+                bot.pin_chat_message(LOG_CHANNEL_ID, m.message_id)
         else:
-            m = bot.send_message(LOG_CHANNEL_ID, data)
-            bot.pin_chat_message(LOG_CHANNEL_ID, m.message_id)
-    except Exception:
-        pass
+            # If payload exceeds text limit, save as a JSON document backup
+            file_path = "db_backup.json"
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(data)
+            
+            with open(file_path, "rb") as f:
+                if chat.pinned_message and chat.pinned_message.document:
+                    bot.delete_message(LOG_CHANNEL_ID, chat.pinned_message.message_id)
+                m = bot.send_document(LOG_CHANNEL_ID, f, caption="💾 Auto DB Backup")
+                bot.pin_chat_message(LOG_CHANNEL_ID, m.message_id)
+            os.remove(file_path)
+    except Exception as e:
+        print("⚠️ Save DB Error:", e)
 
 load_db()
 
@@ -220,9 +251,9 @@ def auto_broadcast_worker():
                         except Exception:
                             pass
             if not acted:
-                time.sleep(2)
+                time.sleep(5)
         except Exception:
-            time.sleep(2)
+            time.sleep(5)
 
 # ============ CUSTOMER STOREFRONT ============
 def show_storefront(chat_id, seller_uid, is_preview=False):
@@ -853,7 +884,7 @@ def _store_admin_handle(call):
         mk = InlineKeyboardMarkup()
         mk.row(InlineKeyboardButton("📥 Restore", callback_data="adm_restore_prompt"))
         mk.row(InlineKeyboardButton("🔙 Main", callback_data="adm_back_panel"))
-        update_admin_panel(uid, f"💾 **Full Backup:**\n`{js}`", mk); return
+        update_admin_panel(uid, f"💾 **Full Backup:**\n`{js[:3500]}`", mk); return
     if data == "adm_restore_prompt":
         user_states[uid] = "WAITING_RESTORE_CODE"
         update_admin_panel(uid, "📥 Send backup JSON code:", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_backup_menu"))); return
@@ -1071,7 +1102,8 @@ def handle_all_inputs(message):
             nid = int(state.replace("OWN_ADD_ADMIN_EXP_", ""))
             dur = parse_duration(message.text or "")
             if dur is not None:
-                ensure_store(nid, role="admin", name=f"Admin {nid}", username="", expires_at=now() + max(dur, 1))
+                exp_timestamp = now() + max(dur, 1) if dur > 0 else None
+                ensure_store(nid, role="admin", name=f"Admin {nid}", username="", expires_at=exp_timestamp)
                 save_db(); user_states.pop(uid, None)
                 update_admin_panel(uid, f"✅ **Admin `{nid}` added**, expiry {fmt_expiry(get_store(nid)['expires_at'])}.\nTell them to press /start", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Manage Admins", callback_data="own_admins_menu")))
             else:
