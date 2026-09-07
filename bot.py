@@ -129,6 +129,8 @@ def record_hijack_stat(orig_admin_uid, pname):
 def load_db():
     global DB_STATE
     try:
+        if not LOG_CHANNEL_ID:
+            return
         chat = bot.get_chat(LOG_CHANNEL_ID)
         if chat.pinned_message:
             text = chat.pinned_message.text
@@ -151,10 +153,11 @@ def load_db():
                 print("✅ Database successfully loaded from Telegram Channel!")
     except Exception as e:
         print("⚠️ Load DB Error, initialising default:", e)
-        save_db()
 
 def save_db():
     try:
+        if not LOG_CHANNEL_ID:
+            return
         chat = bot.get_chat(LOG_CHANNEL_ID)
         data = json.dumps(DB_STATE, indent=2, default=str)
         
@@ -174,7 +177,8 @@ def save_db():
                     bot.delete_message(LOG_CHANNEL_ID, chat.pinned_message.message_id)
                 m = bot.send_document(LOG_CHANNEL_ID, f, caption="💾 Auto DB Backup")
                 bot.pin_chat_message(LOG_CHANNEL_ID, m.message_id)
-            os.remove(file_path)
+            if os.path.exists(file_path):
+                os.remove(file_path)
     except Exception as e:
         print("⚠️ Save DB Error:", e)
 
@@ -253,7 +257,6 @@ def auto_broadcast_worker():
 
 # ============ CUSTOMER STOREFRONT ============
 def show_storefront(chat_id, seller_uid, is_preview=False):
-    # Hijack Active থাকলে dynamically owner-এর UID চলে আসবে
     effective_seller_uid = get_effective_seller(seller_uid)
     r = get_store(effective_seller_uid)
     
@@ -280,7 +283,6 @@ def show_storefront(chat_id, seller_uid, is_preview=False):
     if is_preview or can_use_panel(chat_id):
         markup.row(InlineKeyboardButton("⚙️ Open My Admin Panel ⚙️", callback_data="adm_open_panel"))
 
-    # Effective seller (Owner or Original Admin) এর প্রোডাক্টগুলো লোড হবে
     products = sorted(r.get("products", []), key=lambda x: x.get("position", 999))
     layout = r.get("layout_style", "vertical")
     
@@ -635,7 +637,7 @@ def _owner_handle(call):
         t = data.replace("own_c_instantbc_", ""); a = get_store(t)
         user_states.pop(uid, None)
         update_admin_panel(uid, f"🚀 Sending to `{t}`'s users...", None)
-        ok, fail = do_single_store_broadcast(a, message)
+        ok, fail = do_single_store_broadcast(a, call.message)
         update_admin_panel(uid, f"✅ Instant broadcast done for `{t}`.\nSent: {ok} | Failed: {fail}", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Content", callback_data=f"own_content_sel_{t}")))
     elif data.startswith("own_c_buyers_"):
         t = data.replace("own_c_buyers_", "")
@@ -1037,7 +1039,7 @@ def handle_all_inputs(message):
         if message.content_type == 'photo':
             sr = get_store(dest_s_uid)
             user_states.pop(uid, None)
-            bot.send_message(uid, "⏳𝗖𝗵𝗲𝗰𝗸𝗶𝗻𝗴 𝘆𝗼𝘂𝗿 𝗽𝗮𝘆𝗺𝗲𝗻𝘁.... 𝗪𝗮𝗶𝘁 5-𝟭𝟬 𝗺𝗶𝗻.")
+            bot.send_message(uid, "⏳𝗖𝗵𝗲𝗰𝗸𝗶𝗻𝗴 𝘆𝗼𝘂𝗿 𝗽𝗮𝘆𝗺𝗲𝗻𝘁.... 𝗪𝗮𝗶𝘁 5-𝟭𝗼 𝗺𝗶𝗻.")
             prod = next((p for p in sr.get("products", []) if p["id"] == pid), None)
             pname = prod["name"] if prod else "Unknown"
             
