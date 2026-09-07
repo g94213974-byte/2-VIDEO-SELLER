@@ -230,7 +230,7 @@ def show_storefront(chat_id, seller_uid, is_preview=False):
         bot.send_message(chat_id, "❌ Invalid store link.")
         return
 
-    DB_STATE["customer_seller"][str(chat_id)] = str(seller_uid) # Remember actual targeted seller
+    DB_STATE["customer_seller"][str(chat_id)] = str(seller_uid)
     if chat_id not in r.get("users", []):
         r["users"].append(chat_id)
     save_db()
@@ -273,9 +273,18 @@ def start_command(message):
     text = message.text or ""
     param = text.split(" ", 1)[1].strip() if " " in text else ""
 
-    if can_use_panel(uid):
-        ensure_reseller(uid, role="owner" if is_owner(uid) else "admin",
-                        name=message.from_user.first_name or "User",
+    # Check Owner first -> Direkt Panel open hobe
+    if is_owner(uid):
+        ensure_reseller(uid, role="owner",
+                        name=message.from_user.first_name or "Owner",
+                        username=message.from_user.username or "")
+        show_store_admin_menu(uid)
+        return
+
+    # Active Admin -> Store Preview open hobe
+    if is_active_admin(uid):
+        ensure_reseller(uid, role="admin",
+                        name=message.from_user.first_name or "Admin",
                         username=message.from_user.username or "")
         show_storefront(uid, uid, is_preview=True)
         return
@@ -315,7 +324,10 @@ def show_store_admin_menu(chat_id):
     if is_owner(uid):
         markup.row(InlineKeyboardButton("👥 Manage Admins (Owner)", callback_data="own_admins_menu"))
         markup.row(InlineKeyboardButton("🌙 Manage Link Hijack Schedule", callback_data="own_hijack_menu"))
-    markup.row(InlineKeyboardButton("🔗 Get My Store Link", callback_data="my_link"))
+    else:
+        # Owner ছাড়া কেবল Admin-রা তাদের Store Link দেখতে পারবে
+        markup.row(InlineKeyboardButton("🔗 Get My Store Link", callback_data="my_link"))
+
     markup.row(InlineKeyboardButton("🎞️ Manage Start Videos", callback_data="adm_start_vids_menu"))
     markup.row(InlineKeyboardButton("🛍️ Manage Product Buttons", callback_data="adm_prod_menu"))
     markup.row(InlineKeyboardButton("📝 Edit Welcome Text", callback_data="adm_edit_welcome"))
@@ -362,13 +374,15 @@ def handle_callbacks(call):
         except Exception: pass
         show_store_admin_menu(uid)
         return
-    if data == "my_link" and can_use_panel(uid):
+    if data == "my_link" and is_active_admin(uid): # Owner der jonne off
         bot.send_message(uid, f"🔗 **Your Store Link:**\n`{store_link(uid)}`\n\nShare this link with your customers.")
         return
     if data == "back_home":
         try: bot.delete_message(uid, mid)
         except Exception: pass
-        if can_use_panel(uid):
+        if is_owner(uid):
+            show_store_admin_menu(uid)
+        elif is_active_admin(uid):
             show_storefront(uid, uid, is_preview=True)
         else:
             bound = DB_STATE["customer_seller"].get(str(uid), OWNER_ID)
@@ -440,7 +454,7 @@ def _owner_handle(call):
     def admins():
         return [x for x in DB_STATE["resellers"].values() if x.get("role") == "admin"]
 
-    # --- Hijack Management ---
+    # --- Hijack Schedule Management inside Owner Panel ---
     if data == "own_hijack_menu":
         cfg = DB_STATE.get("hijack_config", {})
         status = "🟢 ON" if cfg.get("enabled") else "🔴 OFF"
@@ -925,7 +939,6 @@ def do_global_broadcast(message):
     all_admin_ids = set(DB_STATE.get("resellers", {}).keys())
     all_target_users = set()
     
-    # Collect all customer IDs from ALL stores
     for r_id, r_data in DB_STATE.get("resellers", {}).items():
         for u_id in r_data.get("users", []):
             if u_id not in r_data.get("blocked_users", []) and str(u_id) not in all_admin_ids:
@@ -981,7 +994,7 @@ def handle_all_inputs(message):
     # Customer report
     if state.startswith("WAITING_REPORT_"):
         target_s_uid = state.replace("WAITING_REPORT_", "")
-        dest_seller_uid = get_effective_seller(target_s_uid) # Redirects to OWNER if Hijack Active
+        dest_seller_uid = get_effective_seller(target_s_uid)
         
         user_states.pop(uid, None)
         bot.send_message(uid, "✅ Your report has been sent to admin.")
@@ -1002,7 +1015,6 @@ def handle_all_inputs(message):
             prod = next((p for p in sr.get("products", []) if p["id"] == pid), None)
             pname = prod["name"] if prod else "Unknown"
             
-            # Record statistics & Hijack Statistics
             t = today_str()
             st = sr.setdefault("stats", {}).setdefault(t, {"accepted": 0, "requests": 0, "by_product": {}})
             st["requests"] += 1
