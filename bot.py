@@ -1,4 +1,4 @@
-import os
+Import os
 import json
 import time
 import threading
@@ -65,6 +65,7 @@ def ensure_store(uid, role="admin", name="", username="", expires_at=None):
         DB_STATE["stores"][str(uid)] = s
         save_db()
     else:
+        # Update details if available
         if role: s["role"] = role
         if name: s["name"] = name
         if username: s["username"] = username
@@ -81,7 +82,7 @@ def is_active_admin(uid):
         return False
     exp = s.get("expires_at")
     if exp is None:
-        return True 
+        return True # Default permanent if no expiry set
     return now() <= exp
 
 def can_use_panel(uid):
@@ -125,16 +126,15 @@ def record_hijack_stat(orig_admin_uid, pname):
     adm_stats["products"][pname] = adm_stats["products"].get(pname, 0) + 1
     save_db()
 
-# ============ PERSISTENCE ============
+# ============ PERSISTENCE (ROBUST TELEGRAM CHANNEL SYNC) ============
 def load_db():
     global DB_STATE
     try:
-        if not LOG_CHANNEL_ID:
-            return
         chat = bot.get_chat(LOG_CHANNEL_ID)
         if chat.pinned_message:
             text = chat.pinned_message.text
             if not text and chat.pinned_message.document:
+                # If backup was saved as document file
                 file_info = bot.get_file(chat.pinned_message.document.file_id)
                 downloaded_file = bot.download_file(file_info.file_path)
                 text = downloaded_file.decode('utf-8')
@@ -153,14 +153,14 @@ def load_db():
                 print("✅ Database successfully loaded from Telegram Channel!")
     except Exception as e:
         print("⚠️ Load DB Error, initialising default:", e)
+        save_db()
 
 def save_db():
     try:
-        if not LOG_CHANNEL_ID:
-            return
         chat = bot.get_chat(LOG_CHANNEL_ID)
         data = json.dumps(DB_STATE, indent=2, default=str)
         
+        # If payload is small enough, save directly as text message
         if len(data) < 3900:
             if chat.pinned_message and chat.pinned_message.text:
                 bot.edit_message_text(data, LOG_CHANNEL_ID, chat.pinned_message.message_id)
@@ -168,6 +168,7 @@ def save_db():
                 m = bot.send_message(LOG_CHANNEL_ID, data)
                 bot.pin_chat_message(LOG_CHANNEL_ID, m.message_id)
         else:
+            # If payload exceeds text limit, save as a JSON document backup
             file_path = "db_backup.json"
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(data)
@@ -177,8 +178,7 @@ def save_db():
                     bot.delete_message(LOG_CHANNEL_ID, chat.pinned_message.message_id)
                 m = bot.send_document(LOG_CHANNEL_ID, f, caption="💾 Auto DB Backup")
                 bot.pin_chat_message(LOG_CHANNEL_ID, m.message_id)
-            if os.path.exists(file_path):
-                os.remove(file_path)
+            os.remove(file_path)
     except Exception as e:
         print("⚠️ Save DB Error:", e)
 
@@ -285,7 +285,6 @@ def show_storefront(chat_id, seller_uid, is_preview=False):
 
     products = sorted(r.get("products", []), key=lambda x: x.get("position", 999))
     layout = r.get("layout_style", "vertical")
-    
     if layout == "horizontal":
         row = []
         for p in products:
@@ -439,10 +438,8 @@ def handle_callbacks(call):
         eff_s_uid = get_effective_seller(s_uid)
         sr = get_store(eff_s_uid)
         if not sr: return
-        
         prod = next((p for p in sr.get("products", []) if p["id"] == pid), None)
         if not prod: return
-        
         send_videos_as_album(uid, prod.get("videos", []))
         caption = f"📌 **{prod['name']}**"
         if prod.get("desc"): caption += f"\n\n{prod['desc']}"
@@ -634,11 +631,8 @@ def _owner_handle(call):
         t = data.replace("own_c_timerbc_", ""); user_states[uid] = f"OWN_C_TIMERBC_{t}"
         update_admin_panel(uid, "📤 **Send the NEW timer-broadcast message** for this admin.", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data=f"own_content_sel_{t}")))
     elif data.startswith("own_c_instantbc_"):
-        t = data.replace("own_c_instantbc_", ""); a = get_store(t)
-        user_states.pop(uid, None)
-        update_admin_panel(uid, f"🚀 Sending to `{t}`'s users...", None)
-        ok, fail = do_single_store_broadcast(a, call.message)
-        update_admin_panel(uid, f"✅ Instant broadcast done for `{t}`.\nSent: {ok} | Failed: {fail}", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Content", callback_data=f"own_content_sel_{t}")))
+        t = data.replace("own_c_instantbc_", ""); user_states[uid] = f"OWN_C_INSTANTBC_{t}"
+        update_admin_panel(uid, "🚀 **Send message to broadcast ONLY to THIS admin's users:**", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data=f"own_content_sel_{t}")))
     elif data.startswith("own_c_buyers_"):
         t = data.replace("own_c_buyers_", "")
         a = get_store(t); buyers = a.get("buyers", [])
@@ -1039,7 +1033,7 @@ def handle_all_inputs(message):
         if message.content_type == 'photo':
             sr = get_store(dest_s_uid)
             user_states.pop(uid, None)
-            bot.send_message(uid, "⏳𝗖𝗵𝗲𝗰𝗸𝗶𝗻𝗴 𝘆𝗼𝘂𝗿 𝗽𝗮𝘆𝗺𝗲𝗻𝘁.... 𝗪𝗮𝗶𝘁 5-𝟭𝗼 𝗺𝗶𝗻.")
+            bot.send_message(uid, "⏳𝗖𝗵𝗲𝗰𝗸𝗶𝗻𝗴 𝘆𝗼𝘂𝗿 𝗽𝗮𝘆𝗺𝗲𝗻𝘁.... 𝗪𝗮𝗶𝘁 5-𝟭𝟬 𝗺𝗶𝗻.")
             prod = next((p for p in sr.get("products", []) if p["id"] == pid), None)
             pname = prod["name"] if prod else "Unknown"
             
