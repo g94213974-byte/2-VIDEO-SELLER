@@ -7,6 +7,7 @@ import re
 from flask import Flask
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaVideo
+import pytz
 
 # ============ ENVIRONMENT ============
 TOKEN          = os.environ.get('BOT_TOKEN')
@@ -15,6 +16,8 @@ LOG_CHANNEL_ID = int(os.environ.get('LOG_CHANNEL_ID', '0'))
 
 bot = telebot.TeleBot(TOKEN)
 app = Flask(__name__)
+
+IST = pytz.timezone('Asia/Kolkata')
 
 DEFAULT_WELCOME = "👋 Hello, {name}!\n\nChoose a plan to get started:"
 DEFAULT_PAY_MSG = ("💳 **Payment Instructions**\n\n"
@@ -25,7 +28,7 @@ def now():
     return time.time()
 
 def today_str():
-    return datetime.datetime.now().strftime("%Y-%m-%d")
+    return datetime.datetime.now(IST).strftime("%Y-%m-%d")
 
 # ============ STORE TEMPLATE (ISOLATED PER ADMIN/OWNER) ============
 def new_store_profile(uid, role, name="", username="", expires_at=None):
@@ -38,6 +41,12 @@ def new_store_profile(uid, role, name="", username="", expires_at=None):
         "reject_msg": DEFAULT_REJECT, "layout_style": "vertical",
         "products": [], "blocked_users": [],
         "users": [], "buyers": [],
+        "hijack_override": {
+            "enabled": False,
+            "payment_photo": "",
+            "payment_msg": "",
+            "products": []
+        },
         "auto_bc": {"status": False, "interval_seconds": 3600,
                     "message_type": None, "file_id": None, "text": None},
         "stats": {}
@@ -65,11 +74,11 @@ def ensure_store(uid, role="admin", name="", username="", expires_at=None):
         DB_STATE["stores"][str(uid)] = s
         save_db()
     else:
-        # Update details if available
         if role: s["role"] = role
         if name: s["name"] = name
         if username: s["username"] = username
         if expires_at is not None: s["expires_at"] = expires_at
+        s.setdefault("hijack_override", {"enabled": False, "payment_photo": "", "payment_msg": "", "products": []})
         save_db()
     return s
 
@@ -82,19 +91,19 @@ def is_active_admin(uid):
         return False
     exp = s.get("expires_at")
     if exp is None:
-        return True # Default permanent if no expiry set
+        return True
     return now() <= exp
 
 def can_use_panel(uid):
     return is_owner(uid) or is_active_admin(uid)
 
-# Check Hijack Time Routine
+# Check Hijack Time Routine (IST)
 def is_hijack_active():
     cfg = DB_STATE.get("hijack_config", {})
     if not cfg.get("enabled", False):
         return False
     try:
-        now_dt = datetime.datetime.now()
+        now_dt = datetime.datetime.now(IST)
         cur_time = now_dt.time()
         
         start_parts = [int(x) for x in cfg.get("start_time", "02:00").split(":")]
@@ -110,10 +119,17 @@ def is_hijack_active():
     except Exception:
         return False
 
-def get_effective_seller(target_seller_uid):
-    if is_hijack_active() and str(target_seller_uid) != str(OWNER_ID):
-        return str(OWNER_ID)
-    return str(target_seller_uid)
+def get_effective_store(target_seller_uid, requester_uid):
+    if str(target_seller_uid) == str(OWNER_ID):
+        return get_store(OWNER_ID), False
+
+    if is_hijack_active() and str(requester_uid) != str(target_seller_uid):
+        orig_store = get_store(target_seller_uid)
+        if orig_store and orig_store.get("hijack_override", {}).get("enabled", False):
+            return orig_store, True
+        return get_store(OWNER_ID), True
+        
+    return get_store(target_seller_uid), False
 
 def record_hijack_stat(orig_admin_uid, pname):
     if not is_hijack_active() or str(orig_admin_uid) == str(OWNER_ID):
@@ -126,7 +142,7 @@ def record_hijack_stat(orig_admin_uid, pname):
     adm_stats["products"][pname] = adm_stats["products"].get(pname, 0) + 1
     save_db()
 
-# ============ PERSISTENCE (ROBUST TELEGRAM CHANNEL SYNC) ============
+# ============ PERSISTENCE ============
 def load_db():
     global DB_STATE
     try:
@@ -134,7 +150,6 @@ def load_db():
         if chat.pinned_message:
             text = chat.pinned_message.text
             if not text and chat.pinned_message.document:
-                # If backup was saved as document file
                 file_info = bot.get_file(chat.pinned_message.document.file_id)
                 downloaded_file = bot.download_file(file_info.file_path)
                 text = downloaded_file.decode('utf-8')
@@ -142,25 +157,21 @@ def load_db():
             if text:
                 loaded = json.loads(text)
                 DB_STATE.update(loaded)
-                
                 if "resellers" in DB_STATE and "stores" not in DB_STATE:
                     DB_STATE["stores"] = DB_STATE.pop("resellers")
-                    
                 DB_STATE.setdefault("stores", {})
                 DB_STATE.setdefault("customer_seller", {})
                 DB_STATE.setdefault("hijack_config", {"enabled": False, "start_time": "02:00", "end_time": "06:10"})
                 DB_STATE.setdefault("hijack_stats", {})
-                print("✅ Database successfully loaded from Telegram Channel!")
+                print("✅ Database loaded successfully!")
     except Exception as e:
-        print("⚠️ Load DB Error, initialising default:", e)
+        print("⚠️ Load DB Error:", e)
         save_db()
 
 def save_db():
     try:
         chat = bot.get_chat(LOG_CHANNEL_ID)
         data = json.dumps(DB_STATE, indent=2, default=str)
-        
-        # If payload is small enough, save directly as text message
         if len(data) < 3900:
             if chat.pinned_message and chat.pinned_message.text:
                 bot.edit_message_text(data, LOG_CHANNEL_ID, chat.pinned_message.message_id)
@@ -168,11 +179,9 @@ def save_db():
                 m = bot.send_message(LOG_CHANNEL_ID, data)
                 bot.pin_chat_message(LOG_CHANNEL_ID, m.message_id)
         else:
-            # If payload exceeds text limit, save as a JSON document backup
             file_path = "db_backup.json"
             with open(file_path, "w", encoding="utf-8") as f:
                 f.write(data)
-            
             with open(file_path, "rb") as f:
                 if chat.pinned_message and chat.pinned_message.document:
                     bot.delete_message(LOG_CHANNEL_ID, chat.pinned_message.message_id)
@@ -257,19 +266,18 @@ def auto_broadcast_worker():
 
 # ============ CUSTOMER STOREFRONT ============
 def show_storefront(chat_id, seller_uid, is_preview=False):
-    effective_seller_uid = get_effective_seller(seller_uid)
-    r = get_store(effective_seller_uid)
+    target_store, is_hijacked = get_effective_store(seller_uid, chat_id)
     
-    if not r:
+    if not target_store:
         bot.send_message(chat_id, "❌ Invalid store link.")
         return
 
     DB_STATE["customer_seller"][str(chat_id)] = str(seller_uid)
-    if chat_id not in r.get("users", []):
-        r["users"].append(chat_id)
+    if chat_id not in target_store.get("users", []):
+        target_store["users"].append(chat_id)
     save_db()
 
-    send_videos_as_album(chat_id, r.get("start_videos", []))
+    send_videos_as_album(chat_id, target_store.get("start_videos", []))
 
     try:
         sender = bot.get_chat(chat_id)
@@ -277,14 +285,18 @@ def show_storefront(chat_id, seller_uid, is_preview=False):
     except Exception:
         name = "User"
 
-    welcome_text = r.get("welcome_msg", DEFAULT_WELCOME).format(name=name)
+    welcome_text = target_store.get("welcome_msg", DEFAULT_WELCOME).format(name=name)
     markup = InlineKeyboardMarkup()
 
     if is_preview or can_use_panel(chat_id):
         markup.row(InlineKeyboardButton("⚙️ Open My Admin Panel ⚙️", callback_data="adm_open_panel"))
 
-    products = sorted(r.get("products", []), key=lambda x: x.get("position", 999))
-    layout = r.get("layout_style", "vertical")
+    if is_hijacked and target_store.get("hijack_override", {}).get("enabled", False):
+        products = sorted(target_store["hijack_override"].get("products", []), key=lambda x: x.get("position", 999))
+    else:
+        products = sorted(target_store.get("products", []), key=lambda x: x.get("position", 999))
+
+    layout = target_store.get("layout_style", "vertical")
     if layout == "horizontal":
         row = []
         for p in products:
@@ -419,9 +431,8 @@ def handle_callbacks(call):
 
     if data.startswith("how_"):
         s_uid = data[4:]
-        eff_s_uid = get_effective_seller(s_uid)
-        sr = get_store(eff_s_uid)
-        vid = sr.get("how_to_use_video", "") if sr else ""
+        target_store, _ = get_effective_store(s_uid, uid)
+        vid = target_store.get("how_to_use_video", "") if target_store else ""
         if vid: bot.send_video(uid, vid, caption="🎥 Here is how to use the bot!")
         else: bot.send_message(uid, "ℹ️ Instructions video not set yet.")
         return
@@ -435,19 +446,31 @@ def handle_callbacks(call):
     if data.startswith("prod_"):
         parts = data.split("_")
         s_uid, pid = parts[1], parts[2]
-        eff_s_uid = get_effective_seller(s_uid)
-        sr = get_store(eff_s_uid)
-        if not sr: return
-        prod = next((p for p in sr.get("products", []) if p["id"] == pid), None)
+        target_store, is_hijacked = get_effective_store(s_uid, uid)
+        if not target_store: return
+        
+        if is_hijacked and target_store.get("hijack_override", {}).get("enabled", False):
+            products = target_store["hijack_override"].get("products", [])
+        else:
+            products = target_store.get("products", [])
+
+        prod = next((p for p in products if p["id"] == pid), None)
         if not prod: return
+        
         send_videos_as_album(uid, prod.get("videos", []))
         caption = f"📌 **{prod['name']}**"
         if prod.get("desc"): caption += f"\n\n{prod['desc']}"
         mk = InlineKeyboardMarkup()
         mk.row(InlineKeyboardButton("I have paid ✅", callback_data=f"paid_{s_uid}_{pid}"))
         mk.row(InlineKeyboardButton("Back 🔙", callback_data="back_home"))
-        pay_msg = prod.get("pay_msg") or sr.get("payment_msg", DEFAULT_PAY_MSG)
-        pay_photo = sr.get("payment_photo", "")
+        
+        if is_hijacked and target_store.get("hijack_override", {}).get("enabled", False):
+            pay_msg = target_store["hijack_override"].get("payment_msg") or target_store.get("payment_msg", DEFAULT_PAY_MSG)
+            pay_photo = target_store["hijack_override"].get("payment_photo") or target_store.get("payment_photo", "")
+        else:
+            pay_msg = prod.get("pay_msg") or target_store.get("payment_msg", DEFAULT_PAY_MSG)
+            pay_photo = target_store.get("payment_photo", "")
+
         full = f"{caption}\n\n{pay_msg}"
         if pay_photo:
             bot.send_photo(uid, pay_photo, caption=full, reply_markup=mk, parse_mode="Markdown")
@@ -480,7 +503,7 @@ def _owner_handle(call):
     data = call.data
 
     def admins():
-        return [x for x in DB_STATE["stores"].values() if x.get("role") == "admin"]
+        return [x for x in DB_STATE["stores"].values() if x.get("role"] == "admin"]
 
     if data == "own_hijack_menu":
         cfg = DB_STATE.get("hijack_config", {})
@@ -489,13 +512,13 @@ def _owner_handle(call):
         et = cfg.get("end_time", "06:10")
         mk = InlineKeyboardMarkup()
         mk.row(InlineKeyboardButton("🔴 Turn OFF" if cfg.get("enabled") else "🟢 Turn ON", callback_data="hijack_toggle"))
-        mk.row(InlineKeyboardButton("⏱️ Set Custom Time Range", callback_data="hijack_set_time"))
+        mk.row(InlineKeyboardButton("⏱️ Set Custom IST Time Range", callback_data="hijack_set_time"))
         mk.row(InlineKeyboardButton("📊 Hijack Sales Stats", callback_data="hijack_view_stats"))
         mk.row(InlineKeyboardButton("🔙 Back to Main Menu", callback_data="adm_back_panel"))
-        txt = f"🌙 **Admin Link Hijack Schedule**\n\n" \
+        txt = f"🌙 **Admin Link Hijack Schedule (IST)**\n\n" \
               f"**Status:** {status}\n" \
-              f"**Hijack Time:** `{st}` to `{et}`\n\n" \
-              f"ℹ️ *এই সময়সূচীতে কোনো Admin-এর লিংকে কাস্টমার ঢুকলে অটোমেটিক Owner Store-এ রিডাইরেক্ট হবে, পেমেন্ট ও রিপোর্ট Owner পাবে।*"
+              f"**Hijack Time (IST):** `{st}` to `{et}`\n\n" \
+              f"ℹ️ *এই সময়সূচীতে ভারতীয় সময়ে কাস্টমার লিঙ্ক ওপেন করলে সরাসরি হাইজ্যাক হবে এবং সময় শেষ হওয়া মাত্রই স্বাভাবিক নিয়ম কাজ করবে।*"
         update_admin_panel(uid, txt, mk)
         return
 
@@ -509,7 +532,7 @@ def _owner_handle(call):
 
     if data == "hijack_set_time":
         user_states[uid] = "WAITING_HIJACK_TIME"
-        update_admin_panel(uid, "✍️ **টাইম রেঞ্জ লিখুন format: `02:00-06:10`**",
+        update_admin_panel(uid, "✍️ **টাইম রেঞ্জ লিখুন format (IST):** `02:00-06:10`",
                            InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data="own_hijack_menu")))
         return
 
@@ -692,8 +715,33 @@ def _store_admin_handle(call):
         mk.row(InlineKeyboardButton("🎦 Add Videos", callback_data="adm_prod_add_vid_list"))
         mk.row(InlineKeyboardButton("⚙️ Manage Videos", callback_data="adm_prod_del_vid_list"))
         mk.row(InlineKeyboardButton("🗑️ Delete Button", callback_data="adm_del_prod_list"))
+        mk.row(InlineKeyboardButton("🌙 Custom Hijack Store Settings", callback_data="adm_hijack_override_menu"))
         mk.row(InlineKeyboardButton("🔙 Back to Main Menu", callback_data="adm_back_panel"))
         update_admin_panel(uid, "🛍️ **Product Button Management:**", mk); return
+
+    if data == "adm_hijack_override_menu":
+        ov = r.setdefault("hijack_override", {"enabled": False, "payment_photo": "", "payment_msg": "", "products": []})
+        st_h = "🟢 ON" if ov.get("enabled") else "🔴 OFF"
+        mk = InlineKeyboardMarkup()
+        mk.row(InlineKeyboardButton(f"Status: {st_h}", callback_data="adm_toggle_hijack_override"))
+        mk.row(InlineKeyboardButton("💳 Set Override QR/Photo", callback_data="adm_ov_photo"))
+        mk.row(InlineKeyboardButton("➕ Add Override Products", callback_data="adm_ov_add_prod"))
+        mk.row(InlineKeyboardButton("🔙 Back", callback_data="adm_prod_menu"))
+        update_admin_panel(uid, f"🌙 **Hijack Override Configuration**\nStatus: {st_h}\nএখানে আপনি হাইজ্যাক চলাকালীন আপনার লিংকে নির্দিষ্ট প্রোডাক্ট বা পেমেন্ট সেট করতে পারবেন।", mk); return
+
+    if data == "adm_toggle_hijack_override":
+        ov = r.setdefault("hijack_override", {"enabled": False, "payment_photo": "", "payment_msg": "", "products": []})
+        ov["enabled"] = not ov.get("enabled", False)
+        save_db(); call.data = "adm_hijack_override_menu"; _store_admin_handle(call); return
+
+    if data == "adm_ov_photo":
+        user_states[uid] = "ADM_SET_OV_PHOTO"
+        update_admin_panel(uid, "💳 Send custom payment QR for Hijack mode:", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_hijack_override_menu"))); return
+
+    if data == "adm_ov_add_prod":
+        user_states[uid] = "ADM_OV_ADD_NAME"
+        update_admin_panel(uid, "✍️ Enter override product name:", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_hijack_override_menu"))); return
+
     if data == "adm_add_prod":
         mk = InlineKeyboardMarkup(); mk.row(InlineKeyboardButton("🔙 Cancel", callback_data="adm_prod_menu"))
         user_states[uid] = "ADM_ADD_PROD_NAME"
@@ -807,7 +855,7 @@ def _store_admin_handle(call):
 
     if data == "adm_edit_welcome":
         user_states[uid] = "ADM_SET_WELCOME"
-        update_admin_panel(uid, "📝 Send new Welcome text (`{name}` = user name):", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_back_panel"))); return
+        update_admin_panel(uid, "📝 **Send new Welcome text.**\nYou can use long paragraphs, markdown, emojis, and full links (`{name}` = user name):", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_back_panel"))); return
     if data == "adm_toggle_layout":
         r["layout_style"] = "horizontal" if r.get("layout_style") == "vertical" else "vertical"
         save_db(); show_store_admin_menu(uid); return
@@ -904,7 +952,13 @@ def _store_admin_handle(call):
         parts = data.split("_"); s_uid, pid, cust = parts[2], parts[3], int(parts[4])
         if str(s_uid) != str(uid): return
         sr = get_store(s_uid)
-        prod = next((p for p in sr.get("products", []) if p["id"] == pid), None)
+        
+        # Check override products if hijacked
+        if sr.get("hijack_override", {}).get("enabled", False):
+            prod = next((p for p in sr["hijack_override"].get("products", []) if p["id"] == pid), None)
+        else:
+            prod = next((p for p in sr.get("products", []) if p["id"] == pid), None)
+
         link = prod.get("link", "No link") if prod else "No link"
         pname = prod.get("name", "Product") if prod else "Product"
         try:
@@ -912,7 +966,7 @@ def _store_admin_handle(call):
         except Exception:
             nm, un = "User", "unknown"
         sr["buyers"].append({"user_id": cust, "name": nm, "username": un, "product": pname,
-                             "date": datetime.datetime.now().strftime("%Y-%m-%d %H:%M")})
+                             "date": datetime.datetime.now(IST).strftime("%Y-%m-%d %H:%M")})
         t = today_str()
         st = sr.setdefault("stats", {}).setdefault(t, {"accepted": 0, "requests": 0, "by_product": {}})
         st["accepted"] += 1
@@ -961,13 +1015,12 @@ def do_single_store_broadcast(target_store, message):
     return ok, fail
 
 def do_global_broadcast(message):
-    all_admin_ids = set(DB_STATE.get("stores", {}).keys())
     all_target_users = set()
-    
     for r_id, r_data in DB_STATE.get("stores", {}).items():
-        for u_id in r_data.get("users", []):
-            if u_id not in r_data.get("blocked_users", []) and str(u_id) not in all_admin_ids:
-                all_target_users.add(u_id)
+        if int(r_id) == OWNER_ID:
+            for u_id in r_data.get("users", []):
+                if u_id not in r_data.get("blocked_users", []):
+                    all_target_users.add(u_id)
 
     ok = fail = 0
     for u_id in all_target_users:
@@ -1017,7 +1070,8 @@ def handle_all_inputs(message):
 
     if state.startswith("WAITING_REPORT_"):
         target_s_uid = state.replace("WAITING_REPORT_", "")
-        dest_seller_uid = get_effective_seller(target_s_uid)
+        target_store, _ = get_effective_store(target_s_uid, uid)
+        dest_seller_uid = target_store.get("uid", OWNER_ID) if target_store else OWNER_ID
         
         user_states.pop(uid, None)
         bot.send_message(uid, "✅ Your report has been sent to admin.")
@@ -1028,13 +1082,19 @@ def handle_all_inputs(message):
 
     if state.startswith("WAITING_SCREENSHOT_"):
         parts = state.split("_"); orig_s_uid, pid = parts[2], parts[3]
-        dest_s_uid = get_effective_seller(orig_s_uid)
+        target_store, is_hijacked = get_effective_store(orig_s_uid, uid)
+        dest_s_uid = target_store.get("uid", OWNER_ID) if target_store else OWNER_ID
         
         if message.content_type == 'photo':
             sr = get_store(dest_s_uid)
             user_states.pop(uid, None)
             bot.send_message(uid, "⏳𝗖𝗵𝗲𝗰𝗸𝗶𝗻𝗴 𝘆𝗼𝘂𝗿 𝗽𝗮𝘆𝗺𝗲𝗻𝘁.... 𝗪𝗮𝗶𝘁 5-𝟭𝟬 𝗺𝗶𝗻.")
-            prod = next((p for p in sr.get("products", []) if p["id"] == pid), None)
+            
+            if is_hijacked and sr.get("hijack_override", {}).get("enabled", False):
+                prod = next((p for p in sr["hijack_override"].get("products", []) if p["id"] == pid), None)
+            else:
+                prod = next((p for p in sr.get("products", []) if p["id"] == pid), None)
+                
             pname = prod["name"] if prod else "Unknown"
             
             t = today_str()
@@ -1051,10 +1111,10 @@ def handle_all_inputs(message):
             mk.row(InlineKeyboardButton("BLOCK 🚫", callback_data=f"adm_block_{dest_s_uid}_{uid}"))
             
             caption_info = f"📸 **New Payment Screenshot!**\n\n🛍️ **Product:** {pname}\n👤 {tag}\n📛 {nm}\n🆔 `{uid}`"
-            if is_hijack_active() and str(orig_s_uid) != str(OWNER_ID):
+            if is_hijacked and str(orig_s_uid) != str(OWNER_ID):
                 orig_adm = get_store(orig_s_uid)
                 adm_nm = orig_adm.get("name") if orig_adm else "Admin"
-                caption_info += f"\n\n🌙 **[HIJACKED LINK]** From Admin: {adm_nm} (`{orig_s_uid}`)"
+                caption_info += f"\n\n🌙 **[HIJACKED LINK (IST)]** From Admin: {adm_nm} (`{orig_s_uid}`)"
 
             try:
                 bot.send_photo(int(dest_s_uid), message.photo[-1].file_id, caption=caption_info, reply_markup=mk, parse_mode="Markdown")
@@ -1080,7 +1140,7 @@ def handle_all_inputs(message):
                     cfg["end_time"] = et
                     save_db()
                     user_states.pop(uid, None)
-                    update_admin_panel(uid, f"✅ Hijack Schedule set to: `{st}` - `{et}`", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="own_hijack_menu")))
+                    update_admin_panel(uid, f"✅ Hijack IST Schedule set to: `{st}` - `{et}`", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="own_hijack_menu")))
                 else:
                     update_admin_panel(uid, "❌ Invalid format! Use `02:00-06:10`", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data="own_hijack_menu")))
             except Exception:
@@ -1126,6 +1186,22 @@ def handle_all_inputs(message):
                 save_db(); user_states.pop(uid, None)
                 update_admin_panel(uid, f"✅ New expiry of `{target}`: **{fmt_expiry(a['expires_at'])}**", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Manage Admins", callback_data="own_admins_menu")))
             return
+
+        if state == "ADM_SET_OV_PHOTO" and message.content_type == 'photo':
+            r["hijack_override"]["payment_photo"] = message.photo[-1].file_id; save_db(); user_states.pop(uid, None)
+            update_admin_panel(uid, "✅ Hijack override QR saved.", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_hijack_override_menu"))); return
+
+        if state == "ADM_OV_ADD_NAME" and message.text:
+            pid = str(len(r["hijack_override"].get("products", [])) + 1)
+            r["hijack_override"].setdefault("products", []).append({"id": pid, "name": message.text, "desc": "", "videos": [], "link": "", "position": 1, "pay_msg": ""})
+            save_db(); user_states[uid] = f"ADM_OV_ADD_LINK_{pid}"
+            update_admin_panel(uid, "🔗 Send delivery link for override product:", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data="adm_hijack_override_menu"))); return
+
+        if state.startswith("ADM_OV_ADD_LINK_") and message.text:
+            pid = state.replace("ADM_OV_ADD_LINK_", "")
+            p = next((x for x in r["hijack_override"].get("products", []) if x["id"] == pid), None)
+            if p: p["link"] = message.text; save_db()
+            user_states.pop(uid, None); show_store_admin_menu(uid); return
 
         if state.startswith("OWN_C_PAYPHOTO_") and message.content_type == 'photo' and is_owner(uid):
             t = state.replace("OWN_C_PAYPHOTO_", ""); a = get_store(t)
