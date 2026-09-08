@@ -510,7 +510,8 @@ def _owner_handle(call):
     data = call.data
 
     def admins():
-        return [x for x in DB_STATE["stores"].values() if x.get("role"] == "admin"]
+        return [x for x in DB_STATE["stores"].values() if x.get("role") == "admin"]
+
 
 
     if data == "own_hijack_menu":
