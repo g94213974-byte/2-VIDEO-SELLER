@@ -4,7 +4,7 @@ import time
 import threading
 import datetime
 import re
-from flask import Flask
+from flask import Flask, request
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaVideo
 import pytz
@@ -13,6 +13,8 @@ import pytz
 TOKEN          = os.environ.get('BOT_TOKEN')
 OWNER_ID       = int(os.environ.get('OWNER_ID', '0'))
 LOG_CHANNEL_ID = int(os.environ.get('LOG_CHANNEL_ID', '0'))
+# আপনার রেন্ডার সার্ভারের লাইভ ইউআরএল এখানে বসান (শেষে কোনো স্ল্যাশ '/' হবে না)
+RENDER_URL     = os.environ.get('RENDER_URL', 'https://two-video-seller-h3vq.onrender.com')
 
 bot = telebot.TeleBot(TOKEN, parse_mode=None)
 app = Flask(__name__)
@@ -470,7 +472,6 @@ def handle_callbacks(call):
             pay_photo = target_store["hijack_override"].get("payment_photo") or target_store.get("payment_photo", "")
         else:
             if is_hijacked:
-                # যদি হাইজ্যাক হয়ে থাকে এবং ওভাররাইড না থাকে, তবে মূল মালিকের (Owner) পেমেন্ট QR ও মেসেজ দেখাবে
                 owner_store = get_store(OWNER_ID)
                 pay_msg = prod.get("pay_msg") or (owner_store.get("payment_msg") if owner_store else DEFAULT_PAY_MSG)
                 pay_photo = owner_store.get("payment_photo", "") if owner_store else ""
@@ -511,8 +512,6 @@ def _owner_handle(call):
 
     def admins():
         return [x for x in DB_STATE["stores"].values() if x.get("role") == "admin"]
-
-
 
     if data == "own_hijack_menu":
         cfg = DB_STATE.get("hijack_config", {})
@@ -962,7 +961,6 @@ def _store_admin_handle(call):
         if str(s_uid) != str(uid): return
         sr = get_store(s_uid)
         
-        # Check override products if hijacked
         if sr.get("hijack_override", {}).get("enabled", False):
             prod = next((p for p in sr["hijack_override"].get("products", []) if p["id"] == pid), None)
         else:
@@ -1131,7 +1129,6 @@ def handle_all_inputs(message):
             except Exception: pass
         return
 
-    # ============ Reseller inputs ============
     if can_use_panel(uid):
         rr = get_store(uid)
         if not is_owner(uid) and rr.get("expires_at") is not None and now() > rr["expires_at"]:
@@ -1356,25 +1353,37 @@ def handle_all_inputs(message):
         if state == "WAITING_RESTORE_CODE" and message.text:
             try:
                 DB_STATE.update(json.loads(message.text)); save_db(); user_states.pop(uid, None)
-                update_admin_panel(uid, "✅ Settings restored.", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Main", callback_data="adm_back_panel")))
+                update_admin_panel(uid, "✅ Settings restored.", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Main", callback_data="adm_backup_menu")))
             except Exception as e:
                 update_admin_panel(uid, f"❌ Invalid JSON: {e}", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_backup_menu"))); return
 
-# ============ WEB + BOOT ============
+# ============ WEBHOOK & WEB SERVER ============
 @app.route('/')
 def home():
-    return "Multi-Admin Telegram Store Bot is running!"
+    return "Multi-Admin Telegram Store Bot is running via Webhook!"
 
-def run_bot():
-    while True:
-        try:
-            bot.infinity_polling(timeout=60, long_polling_timeout=60)
-        except Exception as e:
-            print("Polling Error:", e)
-            time.sleep(3)
+@app.route(f'/{TOKEN}', methods=['POST'])
+def webhook():
+    if request.headers.get('content-type') == 'application/json':
+        json_string = request.get_data().decode('utf-8')
+        update = telebot.types.Update.de_json(json_string)
+        bot.process_new_updates([update])
+        return "!", 200
+    else:
+        return "Invalid message", 403
 
 if __name__ == "__main__":
-    threading.Thread(target=run_bot, daemon=True).start()
+    # ব্যাকগ্রাউন্ড ওয়ার্কার চালু করা
     threading.Thread(target=auto_broadcast_worker, daemon=True).start()
+    
+    # পুরোনো পোলিং মুছে দিয়ে নতুন Webhook সেটআপ করা
+    try:
+        bot.remove_webhook()
+        time.sleep(1)
+        bot.set_webhook(url=f"{RENDER_URL}/{TOKEN}")
+        print("✅ Webhook set successfully!")
+    except Exception as e:
+        print("⚠️ Webhook setup error:", e)
+
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
