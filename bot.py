@@ -45,7 +45,7 @@ def new_store_profile(uid, role, name="", username="", expires_at=None):
         "hijack_override": {
             "enabled": False,
             "payment_photo": "",
-            "payment_msg": "",
+            "payment_msg": DEFAULT_PAY_MSG,
             "products": []
         },
         "auto_bc": {"status": False, "interval_seconds": 3600,
@@ -65,7 +65,6 @@ DB_STATE = {
     "hijack_stats": {}
 }
 
-# DB Save Optimization Lock & Flag
 db_dirty = False
 db_lock = threading.Lock()
 
@@ -84,9 +83,13 @@ def ensure_store(uid, role="admin", name="", username="", expires_at=None):
         if name and s.get("name") != name: s["name"] = name; updated = True
         if username and s.get("username") != username: s["username"] = username; updated = True
         if expires_at is not None and s.get("expires_at") != expires_at: s["expires_at"] = expires_at; updated = True
-        if "hijack_override" not in s:
-            s["hijack_override"] = {"enabled": False, "payment_photo": "", "payment_msg": "", "products": []}
+        if "hijack_override" not in s or not isinstance(s["hijack_override"], dict):
+            s["hijack_override"] = {"enabled": False, "payment_photo": "", "payment_msg": DEFAULT_PAY_MSG, "products": []}
             updated = True
+        else:
+            if "payment_msg" not in s["hijack_override"]:
+                s["hijack_override"]["payment_msg"] = DEFAULT_PAY_MSG
+                updated = True
         if updated:
             save_db()
     return s
@@ -145,7 +148,6 @@ def record_hijack_stat(orig_admin_uid, pname):
     adm_stats["products"][pname] = adm_stats["products"].get(pname, 0) + 1
     save_db()
 
-# ============ PERSISTENCE (FAST ASYNCHRONOUS SAVING) ============
 def load_db():
     global DB_STATE
     try:
@@ -178,7 +180,7 @@ def save_db():
 def background_db_saver():
     global db_dirty
     while True:
-        time.sleep(5)  # প্রতি ৫ সেকেন্ড পর পর চেক করবে ডাটা পরিবর্তন হয়েছে কিনা
+        time.sleep(5)
         if db_dirty:
             with db_lock:
                 db_dirty = False
@@ -219,7 +221,6 @@ def bot_username():
 def store_link(seller_uid):
     return f"https://t.me/{bot_username()}?start=s{seller_uid}"
 
-# ============ MEDIA ============
 def send_videos_as_album(chat_id, video_list):
     if not video_list: return
     if len(video_list) == 1:
@@ -245,7 +246,6 @@ def fmt_expiry(ts):
     if left < 86400: return f"{int(left//3600)}h {int((left%3600)//60)}m"
     return f"{int(left//86400)}d {int((left%86400)//3600)}h"
 
-# ============ AUTO BROADCAST WORKER ============
 def auto_broadcast_worker():
     while True:
         try:
@@ -280,7 +280,6 @@ def auto_broadcast_worker():
 
 threading.Thread(target=auto_broadcast_worker, daemon=True).start()
 
-# ============ CUSTOMER STOREFRONT ============
 def show_storefront(chat_id, seller_uid, is_preview=False):
     target_store, is_hijacked = get_effective_store(seller_uid, chat_id)
     if not target_store:
@@ -327,7 +326,6 @@ def show_storefront(chat_id, seller_uid, is_preview=False):
                InlineKeyboardButton("Report Issue 📩", callback_data=f"report_{seller_uid}"))
     bot.send_message(chat_id, welcome_text, reply_markup=markup, parse_mode="Markdown")
 
-# ============ /start & /admin ============
 @bot.message_handler(commands=['start', 'admin'])
 def start_command(message):
     uid = message.chat.id
@@ -356,7 +354,6 @@ def start_command(message):
     ensure_store(OWNER_ID, role="owner")
     show_storefront(uid, OWNER_ID)
 
-# ============ PANEL RENDERING ============
 def update_admin_panel(chat_id, text, markup=None):
     try:
         mid = admin_panel_msgs.get(chat_id)
@@ -410,7 +407,6 @@ def show_store_admin_menu(chat_id):
         head = f"👑 **Admin Panel** — {r.get('name','')}\n⏳ Expires: {exp}"
     update_admin_panel(chat_id, head + "\n\nChoose an option:", markup)
 
-# ============ CALLBACKS ============
 @bot.callback_query_handler(func=lambda c: True)
 def handle_callbacks(call):
     try: bot.answer_callback_query(call.id)
@@ -518,7 +514,6 @@ def handle_callbacks(call):
         return
     _store_admin_handle(call)
 
-# ---------- OWNER HANDLER ----------
 def _owner_handle(call):
     uid = call.message.chat.id
     data = call.data
@@ -686,7 +681,6 @@ def _owner_handle(call):
         mk = InlineKeyboardMarkup(); mk.row(InlineKeyboardButton("🔙 Back", callback_data=f"own_content_sel_{t}"))
         update_admin_panel(uid, txt, mk)
 
-# ---------- STORE ADMIN HANDLER ----------
 def _store_admin_handle(call):
     uid = call.message.chat.id
     data = call.data
@@ -741,17 +735,19 @@ def _store_admin_handle(call):
         update_admin_panel(uid, "🛍️ **Product Button Management:**", mk); return
 
     if data == "adm_hijack_override_menu":
-        ov = r.setdefault("hijack_override", {"enabled": False, "payment_photo": "", "payment_msg": "", "products": []})
+        ov = r.setdefault("hijack_override", {"enabled": False, "payment_photo": "", "payment_msg": DEFAULT_PAY_MSG, "products": []})
         st_h = "🟢 ON" if ov.get("enabled") else "🔴 OFF"
         mk = InlineKeyboardMarkup()
         mk.row(InlineKeyboardButton(f"Status: {st_h}", callback_data="adm_toggle_hijack_override"))
         mk.row(InlineKeyboardButton("💳 Set Override QR/Photo", callback_data="adm_ov_photo"))
+        mk.row(InlineKeyboardButton("✏️ Edit Override Payment Text", callback_data="adm_ov_paymsg"))
         mk.row(InlineKeyboardButton("➕ Add Override Products", callback_data="adm_ov_add_prod"))
+        mk.row(InlineKeyboardButton("⚙️ Manage Override Products", callback_data="adm_ov_mng_prod"))
         mk.row(InlineKeyboardButton("🔙 Back", callback_data="adm_prod_menu"))
         update_admin_panel(uid, f"🌙 **Hijack Override Configuration**\nStatus: {st_h}\nএখানে আপনি হাইজ্যাক চলাকালীন আপনার লিংকে নির্দিষ্ট প্রোডাক্ট বা পেমেন্ট সেট করতে পারবেন।", mk); return
 
     if data == "adm_toggle_hijack_override":
-        ov = r.setdefault("hijack_override", {"enabled": False, "payment_photo": "", "payment_msg": "", "products": []})
+        ov = r.setdefault("hijack_override", {"enabled": False, "payment_photo": "", "payment_msg": DEFAULT_PAY_MSG, "products": []})
         ov["enabled"] = not ov.get("enabled", False)
         save_db(); call.data = "adm_hijack_override_menu"; _store_admin_handle(call); return
 
@@ -759,9 +755,27 @@ def _store_admin_handle(call):
         user_states[uid] = "ADM_SET_OV_PHOTO"
         update_admin_panel(uid, "💳 Send custom payment QR for Hijack mode:", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_hijack_override_menu"))); return
 
+    if data == "adm_ov_paymsg":
+        user_states[uid] = "ADM_SET_OV_PAYMSG"
+        update_admin_panel(uid, "✏️ Send custom payment instructions text for Hijack mode:", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_hijack_override_menu"))); return
+
     if data == "adm_ov_add_prod":
         user_states[uid] = "ADM_OV_ADD_NAME"
-        update_admin_panel(uid, "✍️ Enter override product name:", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_hijack_override_menu"))); return
+        update_admin_panel(uid, "✍️ Enter override product/button name:", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_hijack_override_menu"))); return
+
+    if data == "adm_ov_mng_prod":
+        ov = r.setdefault("hijack_override", {"enabled": False, "payment_photo": "", "payment_msg": DEFAULT_PAY_MSG, "products": []})
+        mk = InlineKeyboardMarkup()
+        for p in ov.get("products", []):
+            mk.row(InlineKeyboardButton(f"🗑️ Delete {p['name']}", callback_data=f"adm_ov_del_p_{p['id']}"))
+        mk.row(InlineKeyboardButton("🔙 Back", callback_data="adm_hijack_override_menu"))
+        update_admin_panel(uid, "⚙️ **Manage Override Products:**", mk); return
+
+    if data.startswith("adm_ov_del_p_"):
+        pid = data.replace("adm_ov_del_p_", "")
+        ov = r.setdefault("hijack_override", {"enabled": False, "payment_photo": "", "payment_msg": DEFAULT_PAY_MSG, "products": []})
+        ov["products"] = [x for x in ov.get("products", []) if x["id"] != pid]
+        save_db(); call.data = "adm_ov_mng_prod"; _store_admin_handle(call); return
 
     if data == "adm_add_prod":
         mk = InlineKeyboardMarkup(); mk.row(InlineKeyboardButton("🔙 Cancel", callback_data="adm_prod_menu"))
@@ -1015,7 +1029,6 @@ def _store_admin_handle(call):
         except Exception: pass
         return
 
-# ============ INPUTS & BROADCAST ============
 def do_single_store_broadcast(target_store, message):
     ok = fail = 0
     for u_id in target_store.get("users", []):
@@ -1150,6 +1163,8 @@ def handle_all_inputs(message):
             try: bot.delete_message(uid, message.message_id)
             except Exception: pass
 
+        r = get_store(uid)
+
         if state == "WAITING_HIJACK_TIME" and message.text and is_owner(uid):
             try:
                 parts = message.text.strip().split("-")
@@ -1208,20 +1223,28 @@ def handle_all_inputs(message):
             return
 
         if state == "ADM_SET_OV_PHOTO" and message.content_type == 'photo':
-            r["hijack_override"]["payment_photo"] = message.photo[-1].file_id; save_db(); user_states.pop(uid, None)
+            r.setdefault("hijack_override", {})["payment_photo"] = message.photo[-1].file_id; save_db(); user_states.pop(uid, None)
             update_admin_panel(uid, "✅ Hijack override QR saved.", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_hijack_override_menu"))); return
 
+        if state == "ADM_SET_OV_PAYMSG" and message.text:
+            r.setdefault("hijack_override", {})["payment_msg"] = message.text; save_db(); user_states.pop(uid, None)
+            update_admin_panel(uid, "✅ Hijack override payment text saved.", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_hijack_override_menu"))); return
+
         if state == "ADM_OV_ADD_NAME" and message.text:
-            pid = str(len(r["hijack_override"].get("products", [])) + 1)
-            r["hijack_override"].setdefault("products", []).append({"id": pid, "name": message.text, "desc": "", "videos": [], "link": "", "position": 1, "pay_msg": ""})
+            ov = r.setdefault("hijack_override", {"enabled": False, "payment_photo": "", "payment_msg": DEFAULT_PAY_MSG, "products": []})
+            pid = str(len(ov.get("products", [])) + 1)
+            ov.setdefault("products", []).append({"id": pid, "name": message.text, "desc": "", "videos": [], "link": "", "position": len(ov.get("products", [])) + 1, "pay_msg": ""})
             save_db(); user_states[uid] = f"ADM_OV_ADD_LINK_{pid}"
             update_admin_panel(uid, "🔗 Send delivery link for override product:", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data="adm_hijack_override_menu"))); return
 
         if state.startswith("ADM_OV_ADD_LINK_") and message.text:
             pid = state.replace("ADM_OV_ADD_LINK_", "")
-            p = next((x for x in r["hijack_override"].get("products", []) if x["id"] == pid), None)
+            ov = r.setdefault("hijack_override", {})
+            p = next((x for x in ov.get("products", []) if x["id"] == pid), None)
             if p: p["link"] = message.text; save_db()
-            user_states.pop(uid, None); show_store_admin_menu(uid); return
+            user_states.pop(uid, None)
+            update_admin_panel(uid, f"✅ Override product added successfully!", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_hijack_override_menu")))
+            return
 
         if state.startswith("OWN_C_PAYPHOTO_") and message.content_type == 'photo' and is_owner(uid):
             t = state.replace("OWN_C_PAYPHOTO_", ""); a = get_store(t)
@@ -1249,11 +1272,11 @@ def handle_all_inputs(message):
             update_admin_panel(uid, f"✅ Instant broadcast done for `{t}`.\nSent: {ok} | Failed: {fail}", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Content", callback_data=f"own_content_sel_{t}"))); return
 
         if state == "ADM_ADD_START_VID_MULTIPLE" and message.content_type == 'video':
-            r = get_store(uid); r.setdefault("start_videos", []).append(message.video.file_id); save_db()
+            r.setdefault("start_videos", []).append(message.video.file_id); save_db()
             mk = InlineKeyboardMarkup(); mk.row(InlineKeyboardButton("✅ Done", callback_data="adm_finish_start_vids"))
             update_admin_panel(uid, f"📥 Send more. Added: {len(r['start_videos'])}", mk); return
         if state.startswith("ADM_UPL_PROD_VID_MULTIPLE_") and message.content_type == 'video':
-            r = get_store(uid); pid = state.replace("ADM_UPL_PROD_VID_MULTIPLE_", "")
+            pid = state.replace("ADM_UPL_PROD_VID_MULTIPLE_", "")
             p = next((x for x in r.get("products", []) if x["id"] == pid), None)
             if p:
                 p.setdefault("videos", []).append(message.video.file_id); save_db()
@@ -1261,27 +1284,27 @@ def handle_all_inputs(message):
                 update_admin_panel(uid, f"📥 Send more. Total: {len(p['videos'])}", mk)
             return
         if state.startswith("EDIT_P_NAME_") and message.text:
-            r = get_store(uid); pid = state.replace("EDIT_P_NAME_", "")
+            pid = state.replace("EDIT_P_NAME_", "")
             p = next((x for x in r.get("products", []) if x["id"] == pid), None)
             if p: p["name"] = message.text; save_db()
             user_states.pop(uid, None); show_store_admin_menu(uid); return
         if state.startswith("EDIT_P_DESC_") and message.text:
-            r = get_store(uid); pid = state.replace("EDIT_P_DESC_", "")
+            pid = state.replace("EDIT_P_DESC_", "")
             p = next((x for x in r.get("products", []) if x["id"] == pid), None)
             if p: p["desc"] = message.text; save_db()
             user_states.pop(uid, None); show_store_admin_menu(uid); return
         if state.startswith("EDIT_P_LINK_") and message.text:
-            r = get_store(uid); pid = state.replace("EDIT_P_LINK_", "")
+            pid = state.replace("EDIT_P_LINK_", "")
             p = next((x for x in r.get("products", []) if x["id"] == pid), None)
             if p: p["link"] = message.text; save_db()
             user_states.pop(uid, None); show_store_admin_menu(uid); return
         if state.startswith("EDIT_P_PAYM_") and message.text:
-            r = get_store(uid); pid = state.replace("EDIT_P_PAYM_", "")
+            pid = state.replace("EDIT_P_PAYM_", "")
             p = next((x for x in r.get("products", []) if x["id"] == pid), None)
             if p: p["pay_msg"] = "" if message.text.strip().lower() == "skip" else message.text; save_db()
             user_states.pop(uid, None); show_store_admin_menu(uid); return
         if state.startswith("EDIT_P_POS_") and message.text:
-            r = get_store(uid); pid = state.replace("EDIT_P_POS_", "")
+            pid = state.replace("EDIT_P_POS_", "")
             p = next((x for x in r.get("products", []) if x["id"] == pid), None)
             try:
                 if p: p["position"] = int(message.text); save_db()
@@ -1289,35 +1312,34 @@ def handle_all_inputs(message):
             user_states.pop(uid, None); show_store_admin_menu(uid); return
 
         if state == "ADM_ADD_PROD_NAME" and message.text:
-            r = get_store(uid)
             pid = str(len(r.get("products", [])) + 1)
             r["products"].append({"id": pid, "name": message.text, "desc": "", "videos": [],
                                   "link": "", "position": len(r.get("products", [])) + 1, "pay_msg": ""})
             save_db(); user_states[uid] = f"ADM_ADD_PROD_LINK_{pid}"
             update_admin_panel(uid, f"✅ `{message.text}` created.\n🔗 Now send delivery LINK:", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data="adm_prod_menu"))); return
         if state.startswith("ADM_ADD_PROD_LINK_") and message.text:
-            r = get_store(uid); pid = state.replace("ADM_ADD_PROD_LINK_", "")
+            pid = state.replace("ADM_ADD_PROD_LINK_", "")
             p = next((x for x in r.get("products", []) if x["id"] == pid), None)
             if p: p["link"] = message.text; save_db()
             user_states[uid] = f"ADM_ADD_PROD_DESC_{pid}"
             update_admin_panel(uid, "✅ Link saved.\n✍️ Send product DESCRIPTION (or /skip):", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data="adm_prod_menu"))); return
         if state.startswith("ADM_ADD_PROD_DESC_") and message.text:
-            r = get_store(uid); pid = state.replace("ADM_ADD_PROD_DESC_", "")
+            pid = state.replace("ADM_ADD_PROD_DESC_", "")
             p = next((x for x in r.get("products", []) if x["id"] == pid), None)
             if p: p["desc"] = "" if message.text.strip() == "/skip" else message.text; save_db()
             user_states.pop(uid, None); show_store_admin_menu(uid); return
 
         if state == "ADM_SET_WELCOME" and message.text:
-            r = get_store(uid); r["welcome_msg"] = message.text; save_db()
+            r["welcome_msg"] = message.text; save_db()
             user_states.pop(uid, None); show_store_admin_menu(uid); return
         if state == "ADM_SET_HOW_VID" and message.content_type == 'video':
-            r = get_store(uid); r["how_to_use_video"] = message.video.file_id; save_db()
+            r["how_to_use_video"] = message.video.file_id; save_db()
             user_states.pop(uid, None); show_store_admin_menu(uid); return
         if state == "ADM_SET_PAY_PHOTO" and message.content_type == 'photo':
-            r = get_store(uid); r["payment_photo"] = message.photo[-1].file_id; save_db()
+            r["payment_photo"] = message.photo[-1].file_id; save_db()
             user_states.pop(uid, None); show_store_admin_menu(uid); return
         if state == "ADM_SET_PAY_MSG_TEXT" and message.text:
-            r = get_store(uid); r["payment_msg"] = message.text; save_db()
+            r["payment_msg"] = message.text; save_db()
             user_states.pop(uid, None); show_store_admin_menu(uid); return
 
         if is_owner(uid):
@@ -1327,7 +1349,7 @@ def handle_all_inputs(message):
                 ok, fail = do_global_broadcast(message)
                 update_admin_panel(uid, f"✅ Global Broadcast Done\nSent: {ok} | Failed: {fail}", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Main", callback_data="adm_back_panel"))); return
             if state == "WAITING_AUTOBC_MSG":
-                r = get_store(uid); user_states.pop(uid, None)
+                user_states.pop(uid, None)
                 m_type = message.content_type; f_id = None
                 txt = message.caption or message.text or ""
                 if m_type == "photo": f_id = message.photo[-1].file_id
@@ -1337,14 +1359,14 @@ def handle_all_inputs(message):
                 save_db()
                 update_admin_panel(uid, "✅ Auto broadcast message saved. Turn status ON in menu.", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Auto BC", callback_data="adm_autobc_menu"))); return
             if state == "WAITING_AUTOBC_CUSTOM_TIME" and message.text:
-                r = get_store(uid); user_states.pop(uid, None)
+                user_states.pop(uid, None)
                 try:
                     r["auto_bc"]["interval_seconds"] = max(int(message.text.strip()), 1); save_db()
                     update_admin_panel(uid, f"✅ Timer set: {r['auto_bc']['interval_seconds']}s", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Auto BC", callback_data="adm_autobc_menu")))
                 except ValueError:
                     update_admin_panel(uid, "❌ Invalid number.", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Auto BC", callback_data="adm_autobc_menu"))); return
             if state == "WAITING_BUYERS_BROADCAST":
-                r = get_store(uid); user_states.pop(uid, None)
+                user_states.pop(uid, None)
                 update_admin_panel(uid, "👑 Sending to buyers...", None)
                 ok = fail = 0; seen = set()
                 for b in r.get("buyers", []):
@@ -1370,7 +1392,6 @@ def handle_all_inputs(message):
             except Exception as e:
                 update_admin_panel(uid, f"❌ Invalid JSON: {e}", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_backup_menu"))); return
 
-# ============ WEBHOOK & WEB SERVER ============
 @app.route('/')
 def home():
     return "Multi-Admin Telegram Store Bot is running via Webhook!"
