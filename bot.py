@@ -109,9 +109,11 @@ def is_command_hijack_active():
         end_parts = [int(x) for x in cfg.get("end_time", "02:00").split(":")]
         start_t = datetime.time(start_parts[0], start_parts[1])
         end_t = datetime.time(end_parts[0], end_parts[1])
+        
         if start_t <= end_t:
             return start_t <= cur_time <= end_t
         else:
+            # Handles overnight ranges e.g. 22:00 to 02:00
             return cur_time >= start_t or cur_time <= end_t
     except Exception:
         return False
@@ -120,11 +122,9 @@ def get_effective_store(target_seller_uid, requester_uid):
     if str(target_seller_uid) == str(OWNER_ID):
         return get_store(OWNER_ID), False
         
-    # Admins should never be hijacked when checking their own panel or store
     if can_use_panel(requester_uid):
         return get_store(target_seller_uid), False
 
-    # Check if this user has started the bot anywhere before (First-time check)
     global_started = DB_STATE.setdefault("global_started_users", [])
     is_first_time = str(requester_uid) not in global_started
     
@@ -132,7 +132,7 @@ def get_effective_store(target_seller_uid, requester_uid):
         global_started.append(str(requester_uid))
         save_db()
 
-    # Apply command/store hijack ONLY for absolute first-time users during active window
+    # STRICT CHECK: Ensure hijack is active AND current time is strictly within the allowed schedule window
     if is_first_time and is_command_hijack_active() and str(requester_uid) != str(target_seller_uid):
         cfg = DB_STATE.get("command_hijack_config", {})
         mappings = cfg.get("mappings", {})
@@ -1092,7 +1092,6 @@ def handle_all_inputs(message):
         user_states.pop(uid, None)
         bot.send_message(uid, "✅ Your report has been sent to admin.")
         
-        # Reports from admins should not show hijack banners
         if can_use_panel(uid):
             dest_seller_uid = uid
 
@@ -1106,7 +1105,6 @@ def handle_all_inputs(message):
         target_store, is_hijacked = get_effective_store(orig_s_uid, uid)
         dest_s_uid = target_store.get("uid", OWNER_ID) if target_store else OWNER_ID
         
-        # If an admin sends a screenshot, treat it normally without forwarding hijack flags
         if can_use_panel(uid):
             is_hijacked = False
             dest_s_uid = uid
