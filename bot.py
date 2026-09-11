@@ -16,7 +16,6 @@ OWNER_ID       = int(os.environ.get('OWNER_ID', '0'))
 LOG_CHANNEL_ID = int(os.environ.get('LOG_CHANNEL_ID', '0'))
 RENDER_URL     = os.environ.get('RENDER_URL', 'https://two-video-seller-h3vq.onrender.com')
 
-# Purono token gulo — ei gular webhook delete korte hobe
 OLD_TOKENS = [
     "8820357573:AAHVSYAacKYs4xIqox5NQcbevpn811l2-G0",
     "8601129257:AAEBwVl5CAxnxj37FL6M3Lp5C8_VvDjz3ow",
@@ -399,8 +398,12 @@ def show_store_admin_menu(chat_id):
         head = f"👑 **Admin Panel** — {r.get('name','')}\n⏳ Expires: {exp}"
     update_admin_panel(chat_id, head + "\n\nChoose an option:", markup)
 
+# ============================================================
+# CALLBACK HANDLER — REWRITTEN WITH PROPER ROUTING
+# ============================================================
 @bot.callback_query_handler(func=lambda c: True)
 def handle_callbacks(call):
+    print(f"🔔 CALLBACK: {call.data} from {call.message.chat.id}")
     try: bot.answer_callback_query(call.id)
     except Exception: pass
 
@@ -408,18 +411,25 @@ def handle_callbacks(call):
     data = call.data
     mid = call.message.message_id
 
+    # Universal — close message
     if data == "del_msg":
         try: bot.delete_message(uid, mid)
         except Exception: pass
         return
+
+    # Open admin panel
     if data == "adm_open_panel" and can_use_panel(uid):
         try: bot.delete_message(uid, mid)
         except Exception: pass
         show_store_admin_menu(uid)
         return
+
+    # Store link
     if data == "my_link" and is_active_admin(uid):
         bot.send_message(uid, f"🔗 **Your Store Link:**\n`{store_link(uid)}`\n\nShare this link with your customers.")
         return
+
+    # Back home
     if data == "back_home":
         try: bot.delete_message(uid, mid)
         except Exception: pass
@@ -432,6 +442,7 @@ def handle_callbacks(call):
             show_storefront(uid, bound)
         return
 
+    # === CUSTOMER SIDE ===
     if data.startswith("how_"):
         s_uid = data[4:]
         target_store, _ = get_effective_store(s_uid, uid)
@@ -480,10 +491,16 @@ def handle_callbacks(call):
         user_states[uid] = f"WAITING_SCREENSHOT_{s_uid}_{pid}"
         return
 
-    if (data.startswith("own_") or data.startswith("hijack_")) and is_owner(uid):
-        _owner_handle(call)
-        return
+    # === OWNER-SPECIFIC (checked FIRST before any panel routing) ===
+    if is_owner(uid):
+        if data == "own_admins_menu" or data.startswith("own_") and not data.startswith("own_c_"):
+            return _owner_handle(call)
+        if data.startswith("hijack_"):
+            return _owner_handle(call)
+        if data in ("adm_send_custom_bc", "adm_autobc_menu", "adm_buyers_bc_menu") or data.startswith("adm_autobc_"):
+            return _store_admin_handle(call)
 
+    # === ADMIN PANEL ===
     if not can_use_panel(uid):
         return
     r = get_store(uid)
@@ -491,6 +508,7 @@ def handle_callbacks(call):
         bot.send_message(uid, "❌ Your admin access has **expired**. Contact owner to renew.")
         return
     _store_admin_handle(call)
+
 
 def _owner_handle(call):
     uid = call.message.chat.id
@@ -505,7 +523,6 @@ def _owner_handle(call):
         st = cfg.get("start_time", "00:00")
         et = cfg.get("end_time", "02:00")
         mappings = cfg.get("mappings", {})
-
         current_ist_time = datetime.datetime.now(IST).strftime("%H:%M:%S")
 
         mk = InlineKeyboardMarkup()
@@ -521,7 +538,7 @@ def _owner_handle(call):
               f"⏰ **Current IST Time:** `{current_ist_time}`\n" \
               f"**Status:** {status}\n" \
               f"**Hijack Time (IST):** `{st}` to `{et}`\n\n" \
-              f"🔗 **Current Mappings (Target ➡️ Redirect):**\n{map_text}"
+              f"🔗 **Current Mappings:**\n{map_text}"
         update_admin_panel(uid, txt, mk)
         return
 
@@ -713,14 +730,65 @@ def _owner_handle(call):
         mk = InlineKeyboardMarkup(); mk.row(InlineKeyboardButton("🔙 Back", callback_data=f"own_content_sel_{t}"))
         update_admin_panel(uid, txt, mk)
 
+
 def _store_admin_handle(call):
     uid = call.message.chat.id
     data = call.data
     r = get_store(uid)
+    print(f"📥 _store_admin_handle: data={data}, uid={uid}, is_owner={is_owner(uid)}")
 
     if data == "adm_back_panel":
         show_store_admin_menu(uid); return
 
+    # === AUTO BROADCAST (owner only) — MOVED TO TOP ===
+    if is_owner(uid):
+        if data == "adm_autobc_menu":
+            bc = r.get("auto_bc", {})
+            st = "🟢 ON" if bc.get("status") else "🔴 OFF"
+            iv = bc.get("interval_seconds", 3600)
+            ivt = f"{iv}s" if iv < 60 else (f"{iv//60}m" if iv < 3600 else f"{iv//3600}h")
+            mk = InlineKeyboardMarkup()
+            mk.row(InlineKeyboardButton(("🔴 Turn OFF" if bc.get("status") else "🟢 Turn ON"), callback_data="adm_autobc_toggle"))
+            mk.row(InlineKeyboardButton("✏️ Set Message & Media", callback_data="adm_autobc_set_msg"))
+            mk.row(InlineKeyboardButton("⏱️ Preset Time", callback_data="adm_autobc_set_time"))
+            mk.row(InlineKeyboardButton("✍️ Custom Timer", callback_data="adm_autobc_custom_time"))
+            mk.row(InlineKeyboardButton("🔙 Back to Main Menu", callback_data="adm_back_panel"))
+            prev = (bc.get("text") or "Not set"); prev = (prev[:50]+"...") if len(prev) > 50 else prev
+            update_admin_panel(uid, f"⏱️ **Auto Broadcast**\nStatus: {st}\nInterval: {ivt} ({iv}s)\nType: {bc.get('message_type')}\nPreview: {prev}", mk)
+            return
+
+        if data == "adm_autobc_toggle":
+            r["auto_bc"]["status"] = not r["auto_bc"].get("status", False); save_db()
+            call.data = "adm_autobc_menu"; _store_admin_handle(call); return
+
+        if data == "adm_autobc_set_msg":
+            user_states[uid] = "WAITING_AUTOBC_MSG"
+            update_admin_panel(uid, "📤 Send the message to loop automatically:", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_autobc_menu"))); return
+
+        if data == "adm_autobc_set_time":
+            mk = InlineKeyboardMarkup()
+            mk.row(InlineKeyboardButton("10s", callback_data="adm_autobc_t_10"), InlineKeyboardButton("1m", callback_data="adm_autobc_t_60"), InlineKeyboardButton("5m", callback_data="adm_autobc_t_300"))
+            mk.row(InlineKeyboardButton("1h", callback_data="adm_autobc_t_3600"), InlineKeyboardButton("6h", callback_data="adm_autobc_t_21600"), InlineKeyboardButton("24h", callback_data="adm_autobc_t_86400"))
+            mk.row(InlineKeyboardButton("🔙 Back", callback_data="adm_autobc_menu"))
+            update_admin_panel(uid, "⏱️ Select preset interval:", mk); return
+
+        if data.startswith("adm_autobc_t_"):
+            r["auto_bc"]["interval_seconds"] = int(data.split("_")[3]); save_db()
+            call.data = "adm_autobc_menu"; _store_admin_handle(call); return
+
+        if data == "adm_autobc_custom_time":
+            user_states[uid] = "WAITING_AUTOBC_CUSTOM_TIME"
+            update_admin_panel(uid, "✍️ Type timer in **seconds** (e.g. 30, 120, 3600):", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_autobc_menu"))); return
+
+        if data == "adm_send_custom_bc":
+            user_states[uid] = "WAITING_CUSTOM_BROADCAST"
+            update_admin_panel(uid, "🚀 **Global Broadcast:** Send message to broadcast to ALL USERS:", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_back_panel"))); return
+
+        if data == "adm_buyers_bc_menu":
+            user_states[uid] = "WAITING_BUYERS_BROADCAST"
+            update_admin_panel(uid, "👑 Send message to YOUR buyers only:", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_back_panel"))); return
+
+    # === REST OF ADMIN PANEL ===
     if data == "adm_start_vids_menu":
         mk = InlineKeyboardMarkup()
         mk.row(InlineKeyboardButton("➕ Add Start Videos", callback_data="adm_add_start_vid"))
@@ -896,47 +964,6 @@ def _store_admin_handle(call):
         user_states[uid] = "ADM_SET_PAY_MSG_TEXT"
         update_admin_panel(uid, f"✍️ Current: `{r.get('payment_msg')}`\n\nSend new payment text:", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_pay_config_menu"))); return
 
-    if is_owner(uid):
-        if data == "adm_send_custom_bc":
-            user_states[uid] = "WAITING_CUSTOM_BROADCAST"
-            update_admin_panel(uid, "🚀 **Global Broadcast:** Send message to broadcast to ALL USERS across ALL ADMIN STORES:", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_back_panel"))); return
-
-        if data == "adm_autobc_menu":
-            bc = r.get("auto_bc", {})
-            st = "🟢 ON" if bc.get("status") else "🔴 OFF"
-            iv = bc.get("interval_seconds", 3600)
-            ivt = f"{iv}s" if iv < 60 else (f"{iv//60}m" if iv < 3600 else f"{iv//3600}h")
-            mk = InlineKeyboardMarkup()
-            mk.row(InlineKeyboardButton(("🔴 Turn OFF" if bc.get("status") else "🟢 Turn ON"), callback_data="adm_autobc_toggle"))
-            mk.row(InlineKeyboardButton("✏️ Set Message & Media", callback_data="adm_autobc_set_msg"))
-            mk.row(InlineKeyboardButton("⏱️ Preset Time", callback_data="adm_autobc_set_time"))
-            mk.row(InlineKeyboardButton("✍️ Custom Timer", callback_data="adm_autobc_custom_time"))
-            mk.row(InlineKeyboardButton("🔙 Back to Main Menu", callback_data="adm_back_panel"))
-            prev = (bc.get("text") or "Not set"); prev = (prev[:50]+"...") if len(prev) > 50 else prev
-            update_admin_panel(uid, f"⏱️ **Auto Broadcast**\nStatus: {st}\nInterval: {ivt} ({iv}s)\nType: {bc.get('message_type')}\nPreview: {prev}", mk); return
-        if data == "adm_autobc_toggle":
-            r["auto_bc"]["status"] = not r["auto_bc"].get("status", False); save_db()
-            call.data = "adm_autobc_menu"; _store_admin_handle(call); return
-        if data == "adm_autobc_set_msg":
-            user_states[uid] = "WAITING_AUTOBC_MSG"
-            update_admin_panel(uid, "📤 Send the message to loop automatically:", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_autobc_menu"))); return
-        if data == "adm_autobc_set_time":
-            mk = InlineKeyboardMarkup()
-            mk.row(InlineKeyboardButton("10s", callback_data="adm_autobc_t_10"), InlineKeyboardButton("1m", callback_data="adm_autobc_t_60"), InlineKeyboardButton("5m", callback_data="adm_autobc_t_300"))
-            mk.row(InlineKeyboardButton("1h", callback_data="adm_autobc_t_3600"), InlineKeyboardButton("6h", callback_data="adm_autobc_t_21600"), InlineKeyboardButton("24h", callback_data="adm_autobc_t_86400"))
-            mk.row(InlineKeyboardButton("🔙 Back", callback_data="adm_autobc_menu"))
-            update_admin_panel(uid, "⏱️ Select preset interval:", mk); return
-        if data.startswith("adm_autobc_t_"):
-            r["auto_bc"]["interval_seconds"] = int(data.split("_")[3]); save_db()
-            call.data = "adm_autobc_menu"; _store_admin_handle(call); return
-        if data == "adm_autobc_custom_time":
-            user_states[uid] = "WAITING_AUTOBC_CUSTOM_TIME"
-            update_admin_panel(uid, "✍️ Type timer in **seconds** (e.g. 30, 120, 3600):", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_autobc_menu"))); return
-
-        if data == "adm_buyers_bc_menu":
-            user_states[uid] = "WAITING_BUYERS_BROADCAST"
-            update_admin_panel(uid, "👑 Send message to YOUR buyers only:", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_back_panel"))); return
-
     if data == "adm_view_buyers_list":
         buyers = r.get("buyers", [])
         if not buyers: txt = "📦 No buyers yet."
@@ -972,9 +999,7 @@ def _store_admin_handle(call):
         parts = data.split("_"); s_uid, pid, cust = parts[2], parts[3], int(parts[4])
         if str(s_uid) != str(uid): return
         sr = get_store(s_uid)
-
         prod = next((p for p in sr.get("products", []) if p["id"] == pid), None)
-
         link = prod.get("link", "No link") if prod else "No link"
         pname = prod.get("name", "Product") if prod else "Product"
         try:
@@ -1011,6 +1036,7 @@ def _store_admin_handle(call):
         except Exception: pass
         return
 
+
 def do_single_store_broadcast(target_store, message):
     ok = fail = 0
     for u_id in target_store.get("users", []):
@@ -1036,7 +1062,6 @@ def do_global_broadcast(message):
             for u_id in r_data.get("users", []):
                 if u_id not in r_data.get("blocked_users", []):
                     all_target_users.add(u_id)
-
     ok = fail = 0
     for u_id in all_target_users:
         try:
@@ -1087,13 +1112,10 @@ def handle_all_inputs(message):
         target_s_uid = state.replace("WAITING_REPORT_", "")
         target_store, _ = get_effective_store(target_s_uid, uid)
         dest_seller_uid = target_store.get("uid", OWNER_ID) if target_store else OWNER_ID
-
         user_states.pop(uid, None)
         bot.send_message(uid, "✅ Your report has been sent to admin.")
-
         if can_use_panel(uid):
             dest_seller_uid = uid
-
         un = message.from_user.username
         tag = f"@{un}" if un else "No Username"
         bot.send_message(int(dest_seller_uid), f"📩 **Report from {tag} (`{uid}`):**\n\n{message.text}\n\n*Reply to forward your answer.*", parse_mode="Markdown")
@@ -1103,40 +1125,33 @@ def handle_all_inputs(message):
         parts = state.split("_"); orig_s_uid, pid = parts[2], parts[3]
         target_store, is_hijacked = get_effective_store(orig_s_uid, uid)
         dest_s_uid = target_store.get("uid", OWNER_ID) if target_store else OWNER_ID
-
         if can_use_panel(uid):
             is_hijacked = False
             dest_s_uid = uid
             orig_s_uid = uid
-
         if message.content_type == 'photo':
             sr = get_store(dest_s_uid)
             user_states.pop(uid, None)
             bot.send_message(uid, "⏳𝗖𝗵𝗲𝗰𝗸𝗶𝗻𝗴 𝘆𝗼𝘂𝗿 𝗽𝗮𝘆𝗺𝗲𝗻𝘁.... 𝗪𝗮𝗶𝘁 5-𝟭𝟬 𝗺𝗶𝗻.")
-
             prod = next((p for p in sr.get("products", []) if p["id"] == pid), None)
             pname = prod["name"] if prod else "Unknown"
-
             t = today_str()
             st = sr.setdefault("stats", {}).setdefault(t, {"accepted": 0, "requests": 0, "by_product": {}})
             st["requests"] += 1
             if not can_use_panel(uid):
                 record_hijack_stat(orig_s_uid, pname)
             save_db()
-
             un = message.from_user.username; tag = f"@{un}" if un else "No Username"
             nm = message.from_user.first_name or "User"
             mk = InlineKeyboardMarkup()
             mk.row(InlineKeyboardButton("CONFIRM ✅", callback_data=f"adm_confirm_{dest_s_uid}_{pid}_{uid}"),
                    InlineKeyboardButton("REJECT ❌", callback_data=f"adm_reject_{dest_s_uid}_{uid}"))
             mk.row(InlineKeyboardButton("BLOCK 🚫", callback_data=f"adm_block_{dest_s_uid}_{uid}"))
-
             caption_info = f"📸 **New Payment Screenshot!**\n\n🛍️ **Product:** {pname}\n👤 {tag}\n📛 {nm}\n🆔 `{uid}`"
             if is_hijacked and str(orig_s_uid) != str(OWNER_ID) and not can_use_panel(uid):
                 orig_adm = get_store(orig_s_uid)
                 adm_nm = orig_adm.get("name") if orig_adm else "Admin"
                 caption_info += f"\n\n🌙 **[HIJACKED COMMAND]** From Admin: {adm_nm} (`{orig_s_uid}`)"
-
             try:
                 bot.send_photo(int(dest_s_uid), message.photo[-1].file_id, caption=caption_info, reply_markup=mk, parse_mode="Markdown")
             except Exception: pass
@@ -1355,6 +1370,7 @@ def handle_all_inputs(message):
             except Exception as e:
                 update_admin_panel(uid, f"❌ Invalid JSON: {e}", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_backup_menu"))); return
 
+
 @app.route('/')
 def home():
     return "Multi-Admin Telegram Store Bot is running via Webhook!"
@@ -1369,27 +1385,19 @@ def webhook():
     else:
         return "Invalid message", 403
 
-# ============================================================
-# FALLBACK ROUTE — Purono token gulo 200 return korbe, 404 na
-# ============================================================
 @app.route('/<path:any_path>', methods=['POST'])
 def webhook_fallback(any_path):
-    """Purono token path ignore kore 200 return koro"""
     return "Ignored", 200
 
 
 if __name__ == "__main__":
-    # 1. Purono token gulo webhook delete koro
     for old_t in OLD_TOKENS:
         try:
             r = requests.get(f"https://api.telegram.org/bot{old_t}/deleteWebhook?drop_pending_updates=true", timeout=10)
             print(f"🧹 Old token cleanup: {old_t[:15]}... → HTTP {r.status_code}")
         except Exception as e:
             print(f"⚠️ Old token cleanup err: {e}")
-    
     time.sleep(2)
-    
-    # 2. Notun token er webhook set koro
     try:
         bot.remove_webhook()
         time.sleep(1)
@@ -1397,7 +1405,5 @@ if __name__ == "__main__":
         print(f"✅ Webhook set: {RENDER_URL}/{TOKEN[:15]}...")
     except Exception as e:
         print(f"⚠️ Webhook setup error: {e}")
-    
-    # 3. Flask server chalu koro
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
