@@ -292,10 +292,10 @@ def fmt_expiry(ts):
 
 
 # ============================================================
-# AUTO BROADCAST WORKER
+# AUTO BROADCAST WORKER — EXPANDED ERROR MATCHING
 # ============================================================
 def auto_broadcast_worker():
-    """Continuously broadcasts per store's auto_bc config. Auto-removes blocked users."""
+    """Broadcasts per store. Auto-removes unreachable users."""
     last_sent = {}
     while True:
         try:
@@ -318,10 +318,10 @@ def auto_broadcast_worker():
                 m_type = bc.get("message_type")
                 f_id = bc.get("file_id")
                 txt = bc.get("text") or ""
-                users_list = r.get("users", [])
-                blocked = r.get("blocked_users", [])
+                users_list = list(r.get("users", []))
+                blocked = list(r.get("blocked_users", []))
 
-                print(f"📢 Auto BC [{key}]: sending '{m_type}' to {len(users_list)} users")
+                print(f"📢 Auto BC [{key}]: sending '{m_type}' to {len(users_list)} users (blocked: {len(blocked)})")
                 ok = fail = 0
                 new_blocked = []
                 for u_id in users_list:
@@ -340,11 +340,19 @@ def auto_broadcast_worker():
                     except Exception as e:
                         fail += 1
                         err = str(e).lower()
-                        if ('blocked' in err or 'deactivated' in err or
-                            'chat not found' in err or 'user is deactivated' in err or
-                            'bot was blocked' in err):
+                        print(f"⚠️ Auto BC fail {u_id}: {err[:120]}")
+                        # Expanded matching for unreachable users
+                        if any(kw in err for kw in (
+                            'blocked', 'deactivated', 'chat not found',
+                            'user is deactivated', 'bot was blocked',
+                            'kicked', 'peer_id_invalid', 'forbidden',
+                            'user not found', 'bot was kicked',
+                            'chat_id', 'not enough rights',
+                            'user not found', 'invalid', 'privacy',
+                            'bot can\'t initiate', 'can\'t initiate'
+                        )):
                             new_blocked.append(u_id)
-                            print(f"🚫 Auto-blocking user {u_id}: {err[:60]}")
+                            print(f"🚫 Auto-blocking user {u_id}")
                 # Persist new blocked users
                 if new_blocked:
                     for b in new_blocked:
@@ -428,23 +436,25 @@ def start_command(message):
 
 
 # ============================================================
-# PANEL SENDER — ROBUST (edit OR send new)
+# PANEL SENDER — ROBUST
 # ============================================================
 def update_admin_panel(chat_id, text, markup=None):
     try:
         mid = admin_panel_msgs.get(chat_id)
+        print(f"📝 update_admin_panel: chat={chat_id}, mid={mid}")
         if mid:
             try:
                 bot.edit_message_text(text, chat_id, mid, reply_markup=markup, parse_mode="Markdown")
+                print(f"✅ Panel edited: {mid}")
                 return
             except Exception as e:
-                print(f"edit panel err: {e}")
+                print(f"⚠️ edit panel err: {e}")
                 admin_panel_msgs[chat_id] = None
-        # Send new panel
         m = bot.send_message(chat_id, text, reply_markup=markup, parse_mode="Markdown")
         admin_panel_msgs[chat_id] = m.message_id
+        print(f"✅ New panel sent: {m.message_id}")
     except Exception as e:
-        print("panel err", e)
+        print(f"❌ panel err: {e}")
 
 
 def show_store_admin_menu(chat_id):
@@ -452,8 +462,11 @@ def show_store_admin_menu(chat_id):
     if not can_use_panel(uid):
         return
     r = get_store(uid)
+    if r is None:
+        ensure_store(uid, role="owner" if is_owner(uid) else "admin")
+        r = get_store(uid)
     user_states.pop(uid, None)
-    admin_panel_msgs.pop(uid, None)  # Reset so next panel is fresh
+    admin_panel_msgs.pop(uid, None)
 
     markup = InlineKeyboardMarkup()
     if is_owner(uid):
@@ -501,7 +514,6 @@ def handle_callbacks(call):
     data = call.data
     mid = call.message.message_id
 
-    # Track panel message so edit works after refresh
     if data and (data.startswith("adm_") or data.startswith("own_") or data.startswith("hijack_")):
         admin_panel_msgs[uid] = mid
 
@@ -538,7 +550,6 @@ def handle_callbacks(call):
             show_storefront(uid, bound)
         return
 
-    # CUSTOMER SIDE
     if data.startswith("how_"):
         s_uid = data[4:]
         target_store, _ = get_effective_store(s_uid, uid)
@@ -588,18 +599,16 @@ def handle_callbacks(call):
         user_states[uid] = f"WAITING_SCREENSHOT_{s_uid}_{pid}"
         return
 
-    # OWNER SPECIFIC
     if is_owner(uid):
         if data.startswith("own_") or data.startswith("hijack_"):
             return _owner_handle(call)
         if data.startswith("adm_"):
             return _store_admin_handle(call)
 
-    # ADMIN PANEL
     if not can_use_panel(uid):
         return
     r = get_store(uid)
-    if not is_owner(uid) and r.get("expires_at") is not None and now() > r["expires_at"]:
+    if not is_owner(uid) and r and r.get("expires_at") is not None and now() > r["expires_at"]:
         bot.send_message(uid, "❌ Your admin access has **expired**. Contact owner to renew.")
         return
     _store_admin_handle(call)
@@ -770,9 +779,9 @@ def _owner_handle(call):
     elif data.startswith("own_stats_show_"):
         target = data.replace("own_stats_show_", "")
         a = get_store(target)
-        st = (a.get("stats") or {}).get(today_str(), {})
+        st = (a.get("stats") or {}).get(today_str(), {}) if a else {}
         byprod = st.get("by_product", {})
-        lines = (f"📊 **Stats for {a.get('name','')} (`{target}`) — {today_str()}**\n\n"
+        lines = (f"📊 **Stats for {a.get('name','') if a else '?'} (`{target}`) — {today_str()}**\n\n"
                  f"• Requests: {st.get('requests',0)}\n"
                  f"• Accepted: {st.get('accepted',0)}\n")
         if byprod:
@@ -801,9 +810,9 @@ def _owner_handle(call):
         mk.row(InlineKeyboardButton("🚀 Send Broadcast To This Admin's Users", callback_data=f"own_c_instantbc_{target}"))
         mk.row(InlineKeyboardButton("📦 View Buyers", callback_data=f"own_c_buyers_{target}"))
         mk.row(InlineKeyboardButton("🔙 Back", callback_data="own_content_list"))
-        update_admin_panel(uid, f"🛠️ **Manage content of `{a.get('name','')}` ({target})**\n\n"
-                                f"Payment QR: {'✅' if a.get('payment_photo') else '❌'}\n"
-                                f"Timer BC: {'🟢 ON' if a['auto_bc'].get('status') else '🔴 OFF'}", mk)
+        update_admin_panel(uid, f"🛠️ **Manage content of `{a.get('name','') if a else '?'}` ({target})**\n\n"
+                                f"Payment QR: {'✅' if a and a.get('payment_photo') else '❌'}\n"
+                                f"Timer BC: {'🟢 ON' if a and a['auto_bc'].get('status') else '🔴 OFF'}", mk)
 
     elif data.startswith("own_c_payphoto_"):
         t = data.replace("own_c_payphoto_", "")
@@ -828,8 +837,8 @@ def _owner_handle(call):
     elif data.startswith("own_c_buyers_"):
         t = data.replace("own_c_buyers_", "")
         a = get_store(t)
-        buyers = a.get("buyers", [])
-        txt = f"📦 Buyers of `{a.get('name','')}`:\n\n" if buyers else f"📦 No buyers yet."
+        buyers = a.get("buyers", []) if a else []
+        txt = f"📦 Buyers of `{a.get('name','') if a else '?'}`:\n\n" if buyers else f"📦 No buyers yet."
         for i, b in enumerate(buyers[-20:], 1):
             txt += f"{i}. {b.get('name')} @{b.get('username')} (`{b.get('user_id')}`)\n   🛍️ {b.get('product')} | {b.get('date')}\n"
         mk = InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data=f"own_content_sel_{t}"))
@@ -843,14 +852,21 @@ def _store_admin_handle(call):
     uid = call.message.chat.id
     data = call.data
     r = get_store(uid)
-    print(f"📥 _store_admin_handle: data={data}, uid={uid}, is_owner={is_owner(uid)}")
+    print(f"📥 _store_admin_handle: data={data}, uid={uid}, is_owner={is_owner(uid)}, r_exists={r is not None}")
+
+    if r is None:
+        print(f"❌ Store not found for uid={uid}, creating...")
+        ensure_store(uid, role="owner" if is_owner(uid) else "admin",
+                     name=call.from_user.first_name or "",
+                     username=call.from_user.username or "")
+        r = get_store(uid)
 
     if data == "adm_back_panel":
         admin_panel_msgs.pop(uid, None)
         show_store_admin_menu(uid)
         return
 
-    # === AUTO BROADCAST ===
+    # === AUTO BROADCAST (OWNER ONLY) ===
     if is_owner(uid) and (data == "adm_autobc_menu" or data.startswith("adm_autobc_")):
         bc = r.get("auto_bc", {})
         if data == "adm_autobc_menu":
@@ -893,7 +909,7 @@ def _store_admin_handle(call):
             mk.row(InlineKeyboardButton("🔙 Back to Auto BC", callback_data="adm_autobc_menu"))
             update_admin_panel(uid,
                 "📤 **Send the message to loop automatically.**\n\n"
-                "You can send text, photo, video, or document.\n\n"
+                "Send text, photo, video, or document.\n\n"
                 "After sending, you'll return to the Auto BC menu.",
                 mk)
             return
@@ -1445,7 +1461,7 @@ def handle_all_inputs(message):
 
     if can_use_panel(uid):
         rr = get_store(uid)
-        if not is_owner(uid) and rr.get("expires_at") is not None and now() > rr["expires_at"]:
+        if not is_owner(uid) and rr and rr.get("expires_at") is not None and now() > rr["expires_at"]:
             return
         if state and not state.startswith("WAITING_REPORT_") and not state.startswith("WAITING_SCREENSHOT_"):
             try:
@@ -1454,8 +1470,10 @@ def handle_all_inputs(message):
                 pass
 
         r = get_store(uid)
+        if r is None:
+            ensure_store(uid, role="owner" if is_owner(uid) else "admin")
+            r = get_store(uid)
 
-        # === AUTO BC MESSAGE ===
         if state == "WAITING_AUTOBC_MSG":
             user_states.pop(uid, None)
             m_type = message.content_type
@@ -1484,7 +1502,7 @@ def handle_all_inputs(message):
             ivt = f"{iv}s" if iv < 60 else (f"{iv//60}m" if iv < 3600 else f"{iv//3600}h")
             stat = "🟢 ON" if bc.get("status") else "🔴 OFF"
 
-            admin_panel_msgs.pop(uid, None)  # Reset panel so next is fresh
+            admin_panel_msgs.pop(uid, None)
             mk = InlineKeyboardMarkup()
             mk.row(InlineKeyboardButton("👁 Preview", callback_data="adm_autobc_preview"))
             if bc.get("status"):
