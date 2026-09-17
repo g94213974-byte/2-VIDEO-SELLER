@@ -1369,7 +1369,6 @@ if __name__ == "__main__":
     try:
         bot.remove_webhook()
         time.sleep(1)
-        # রেন্ডার ইউআরএলের শেষে অতিরিক্ত স্ল্যাশ ফিক্স করা হয়েছে
         clean_url = RENDER_URL.rstrip('/')
         bot.set_webhook(url=f"{clean_url}/{TOKEN}")
         print(f"✅ Webhook set successfully!")
