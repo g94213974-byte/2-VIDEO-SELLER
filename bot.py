@@ -11,7 +11,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, InputMedia
 import pytz
 
 # ============ ENVIRONMENT ============
-TOKEN          = os.environ.get('BOT_TOKEN')
+TOKEN          = os.environ.get('BOT_TOKEN', 'YOUR_BOT_TOKEN')
 OWNER_ID       = int(os.environ.get('OWNER_ID', '0'))
 LOG_CHANNEL_ID = int(os.environ.get('LOG_CHANNEL_ID', '0'))
 RENDER_URL     = os.environ.get('RENDER_URL', 'https://two-video-seller-h3vq.onrender.com')
@@ -144,23 +144,24 @@ def record_hijack_stat(orig_admin_uid, pname):
 def load_db():
     global DB_STATE
     try:
-        chat = bot.get_chat(LOG_CHANNEL_ID)
-        if chat.pinned_message:
-            text = chat.pinned_message.text
-            if not text and chat.pinned_message.document:
-                fi = bot.get_file(chat.pinned_message.document.file_id)
-                text = bot.download_file(fi.file_path).decode('utf-8')
-            if text:
-                loaded = json.loads(text)
-                DB_STATE.update(loaded)
-                if "resellers" in DB_STATE and "stores" not in DB_STATE:
-                    DB_STATE["stores"] = DB_STATE.pop("resellers")
-                DB_STATE.setdefault("stores", {})
-                DB_STATE.setdefault("customer_seller", {})
-                DB_STATE.setdefault("command_hijack_config", {"enabled": False, "start_time": "00:00", "end_time": "02:00", "mappings": {}})
-                DB_STATE.setdefault("hijack_stats", {})
-                DB_STATE.setdefault("global_started_users", [])
-                print("✅ Database loaded successfully!")
+        if LOG_CHANNEL_ID != 0:
+            chat = bot.get_chat(LOG_CHANNEL_ID)
+            if chat.pinned_message:
+                text = chat.pinned_message.text
+                if not text and chat.pinned_message.document:
+                    fi = bot.get_file(chat.pinned_message.document.file_id)
+                    text = bot.download_file(fi.file_path).decode('utf-8')
+                if text:
+                    loaded = json.loads(text)
+                    DB_STATE.update(loaded)
+                    if "resellers" in DB_STATE and "stores" not in DB_STATE:
+                        DB_STATE["stores"] = DB_STATE.pop("resellers")
+                    DB_STATE.setdefault("stores", {})
+                    DB_STATE.setdefault("customer_seller", {})
+                    DB_STATE.setdefault("command_hijack_config", {"enabled": False, "start_time": "00:00", "end_time": "02:00", "mappings": {}})
+                    DB_STATE.setdefault("hijack_stats", {})
+                    DB_STATE.setdefault("global_started_users", [])
+                    print("✅ Database loaded successfully!")
     except Exception as e:
         print("⚠️ Load DB Error:", e)
         save_db()
@@ -176,28 +177,30 @@ def background_db_saver():
         if db_dirty:
             with db_lock: db_dirty = False
             try:
-                chat = bot.get_chat(LOG_CHANNEL_ID)
-                data = json.dumps(DB_STATE, indent=2, default=str)
-                if len(data) < 3900:
-                    if chat.pinned_message and chat.pinned_message.text:
-                        bot.edit_message_text(data, LOG_CHANNEL_ID, chat.pinned_message.message_id)
+                if LOG_CHANNEL_ID != 0:
+                    chat = bot.get_chat(LOG_CHANNEL_ID)
+                    data = json.dumps(DB_STATE, indent=2, default=str)
+                    if len(data) < 3900:
+                        if chat.pinned_message and chat.pinned_message.text:
+                            bot.edit_message_text(data, LOG_CHANNEL_ID, chat.pinned_message.message_id)
+                        else:
+                            m = bot.send_message(LOG_CHANNEL_ID, data)
+                            bot.pin_chat_message(LOG_CHANNEL_ID, m.message_id)
                     else:
-                        m = bot.send_message(LOG_CHANNEL_ID, data)
-                        bot.pin_chat_message(LOG_CHANNEL_ID, m.message_id)
-                else:
-                    fp = "db_backup.json"
-                    with open(fp, "w", encoding="utf-8") as f: f.write(data)
-                    with open(fp, "rb") as f:
-                        if chat.pinned_message and chat.pinned_message.document:
-                            bot.delete_message(LOG_CHANNEL_ID, chat.pinned_message.message_id)
-                        m = bot.send_document(LOG_CHANNEL_ID, f, caption="💾 Auto DB Backup")
-                        bot.pin_chat_message(LOG_CHANNEL_ID, m.message_id)
-                    os.remove(fp)
+                        fp = "db_backup.json"
+                        with open(fp, "w", encoding="utf-8") as f: f.write(data)
+                        with open(fp, "rb") as f:
+                            if chat.pinned_message and chat.pinned_message.document:
+                                bot.delete_message(LOG_CHANNEL_ID, chat.pinned_message.message_id)
+                            m = bot.send_document(LOG_CHANNEL_ID, f, caption="💾 Auto DB Backup")
+                            bot.pin_chat_message(LOG_CHANNEL_ID, m.message_id)
+                        os.remove(fp)
             except Exception as e:
                 print("⚠️ Save DB Error:", e)
 
 load_db()
-threading.Thread(target=background_db_saver, daemon=True).start()
+if LOG_CHANNEL_ID != 0:
+    threading.Thread(target=background_db_saver, daemon=True).start()
 
 user_states = {}
 admin_panel_msgs = {}
@@ -234,7 +237,7 @@ def fmt_expiry(ts):
     return f"{int(left//86400)}d {int((left%86400)//3600)}h"
 
 # ============================================================
-# AUTO BROADCAST — parse_mode REMOVED
+# AUTO BROADCAST
 # ============================================================
 def auto_broadcast_worker():
     last_sent = {}
@@ -259,13 +262,11 @@ def auto_broadcast_worker():
                 users_list = list(r.get("users", []))
                 blocked = list(r.get("blocked_users", []))
 
-                print(f"📢 Auto BC [{key}]: sending '{m_type}' to {len(users_list)} users (blocked: {len(blocked)})")
                 ok = fail = 0
                 new_blocked = []
                 for u_id in users_list:
                     if u_id in blocked: continue
                     try:
-                        # NO parse_mode — plain text
                         if m_type == "photo":
                             bot.send_photo(u_id, f_id, caption=txt)
                         elif m_type == "video":
@@ -278,29 +279,23 @@ def auto_broadcast_worker():
                     except Exception as e:
                         fail += 1
                         err = str(e).lower()
-                        print(f"⚠️ Auto BC fail {u_id}: {err[:150]}")
                         if any(kw in err for kw in (
                             'blocked', 'deactivated', 'chat not found',
                             'user is deactivated', 'bot was blocked',
                             'kicked', 'peer_id_invalid', 'forbidden',
                             'user not found', 'bot was kicked',
                             'chat_id', 'not enough rights',
-                            'invalid', 'privacy', 'can\'t initiate',
-                            'can\'t parse entities'  # ignore markdown issues
+                            'invalid', 'privacy', 'can\'t initiate'
                         )):
-                            # Only auto-block if it's NOT a markdown issue
                             if 'parse entities' not in err and 'parse' not in err:
                                 new_blocked.append(u_id)
-                                print(f"🚫 Auto-blocking user {u_id}")
                 if new_blocked:
                     for b in new_blocked:
                         if b not in r.get("blocked_users", []):
                             r.setdefault("blocked_users", []).append(b)
                     save_db()
-                print(f"📢 Auto BC [{key}] done: ✅ {ok} | ❌ {fail}")
             if not acted: time.sleep(5)
         except Exception as e:
-            print(f"auto_broadcast_worker err: {e}")
             time.sleep(5)
 
 threading.Thread(target=auto_broadcast_worker, daemon=True).start()
@@ -350,11 +345,7 @@ def start_command(message):
     ensure_store(OWNER_ID, role="owner")
     show_storefront(uid, OWNER_ID)
 
-# ============================================================
-# PANEL SENDER — ALWAYS NEW MESSAGE
-# ============================================================
 def update_admin_panel(chat_id, text, markup=None):
-    """Delete old panel, send new one."""
     try:
         old_mid = admin_panel_msgs.get(chat_id)
         if old_mid:
@@ -362,7 +353,6 @@ def update_admin_panel(chat_id, text, markup=None):
             except Exception: pass
         m = bot.send_message(chat_id, text, reply_markup=markup)
         admin_panel_msgs[chat_id] = m.message_id
-        print(f"✅ New panel sent: {m.message_id}")
     except Exception as e:
         print(f"❌ panel err: {e}")
 
@@ -401,12 +391,8 @@ def show_store_admin_menu(chat_id):
     head = "👑 **Owner Panel**" if is_owner(uid) else f"👑 **Admin Panel** — {r.get('name','')}\n⏳ Expires: {fmt_expiry(r.get('expires_at'))}"
     update_admin_panel(chat_id, head + "\n\nChoose an option:", markup)
 
-# ============================================================
-# CALLBACK HANDLER
-# ============================================================
 @bot.callback_query_handler(func=lambda c: True)
 def handle_callbacks(call):
-    print(f"🔔 CALLBACK: {call.data} from {call.message.chat.id}")
     try: bot.answer_callback_query(call.id)
     except Exception: pass
 
@@ -487,9 +473,6 @@ def handle_callbacks(call):
         return
     _store_admin_handle(call)
 
-# ============================================================
-# OWNER HANDLER
-# ============================================================
 def _owner_handle(call):
     uid = call.message.chat.id
     data = call.data
@@ -667,14 +650,10 @@ def _owner_handle(call):
             txt += f"{i}. {b.get('name')} @{b.get('username')} (`{b.get('user_id')}`)\n   🛍️ {b.get('product')} | {b.get('date')}\n"
         update_admin_panel(uid, txt, InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data=f"own_content_sel_{t}")))
 
-# ============================================================
-# STORE ADMIN HANDLER
-# ============================================================
 def _store_admin_handle(call):
     uid = call.message.chat.id
     data = call.data
     r = get_store(uid)
-    print(f"📥 _store_admin_handle: data={data}, uid={uid}, is_owner={is_owner(uid)}, r_exists={r is not None}")
     if r is None:
         ensure_store(uid, role="owner" if is_owner(uid) else "admin",
                      name=call.from_user.first_name or "",
@@ -710,8 +689,7 @@ def _store_admin_handle(call):
         if data == "adm_autobc_set_msg":
             user_states[uid] = "WAITING_AUTOBC_MSG"
             update_admin_panel(uid,
-                "📤 **Send the message to loop automatically.**\n\nSend text, photo, video, or document.\n\n"
-                "After sending, you'll return to Auto BC menu.",
+                "📤 **Send the message to loop automatically.**\n\nSend text, photo, video, or document.",
                 InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back to Auto BC", callback_data="adm_autobc_menu")))
             return
         if data == "adm_autobc_preview":
@@ -728,7 +706,7 @@ def _store_admin_handle(call):
                 elif m_type == "document": bot.send_document(uid, f_id, caption=txt)
                 else: bot.send_message(uid, txt)
             except Exception as e:
-                print(f"preview err: {e}")
+                pass
             return
         if data == "adm_autobc_set_time":
             mk = InlineKeyboardMarkup()
@@ -1130,7 +1108,6 @@ def handle_all_inputs(message):
             ensure_store(uid, role="owner" if is_owner(uid) else "admin")
             r = get_store(uid)
 
-        # AUTO BC MESSAGE INPUT — NO parse_mode
         if state == "WAITING_AUTOBC_MSG":
             user_states.pop(uid, None)
             m_type = message.content_type
@@ -1148,7 +1125,6 @@ def handle_all_inputs(message):
             r["auto_bc"]["file_id"] = f_id
             r["auto_bc"]["text"] = txt
             save_db()
-            print(f"✅ Auto BC msg saved: type={m_type}, len={len(txt)}")
             bc = r["auto_bc"]
             iv = bc.get("interval_seconds", 60)
             ivt = f"{iv}s" if iv < 60 else (f"{iv//60}m" if iv < 3600 else f"{iv//3600}h")
@@ -1174,9 +1150,6 @@ def handle_all_inputs(message):
                     save_db(); user_states.pop(uid, None)
                     update_admin_panel(uid, f"✅ Time set: `{parts[0].strip()}` - `{parts[1].strip()}`",
                                        InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="own_hijack_menu")))
-                else:
-                    update_admin_panel(uid, "❌ Use `00:00-02:00`",
-                                       InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data="own_hijack_menu")))
             except Exception: pass
             return
 
@@ -1190,9 +1163,7 @@ def handle_all_inputs(message):
                     user_states[uid] = f"OWN_ADD_ADMIN_EXP_{nid}"
                     update_admin_panel(uid, f"✅ ID `{nid}`. Now expiry: `30`, `10m`, `2h`, `1d`",
                                        InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data="own_admins_menu")))
-            except Exception:
-                update_admin_panel(uid, "❌ Invalid ID.",
-                                   InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Manage", callback_data="own_admins_menu")))
+            except Exception: pass
             return
         if state.startswith("OWN_ADD_ADMIN_EXP_") and is_owner(uid):
             nid = int(state.replace("OWN_ADD_ADMIN_EXP_", ""))
@@ -1203,9 +1174,6 @@ def handle_all_inputs(message):
                 save_db(); user_states.pop(uid, None)
                 update_admin_panel(uid, f"✅ Admin `{nid}` added.",
                                    InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Manage", callback_data="own_admins_menu")))
-            else:
-                update_admin_panel(uid, "❌ Invalid duration.",
-                                   InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Cancel", callback_data="own_admins_menu")))
             return
         if state.startswith("OWN_EXP_IN_") and is_owner(uid):
             target = state.replace("OWN_EXP_IN_", "")
@@ -1216,9 +1184,6 @@ def handle_all_inputs(message):
                 elif dur is not None:
                     cur = a.get("expires_at") or now()
                     a["expires_at"] = max(cur + dur, now())
-                else:
-                    update_admin_panel(uid, "❌ Invalid.", InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="own_exp_list")))
-                    return
                 save_db(); user_states.pop(uid, None)
                 update_admin_panel(uid, f"✅ Expiry `{target}`: {fmt_expiry(a['expires_at'])}",
                                    InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Manage", callback_data="own_admins_menu")))
@@ -1347,8 +1312,7 @@ def handle_all_inputs(message):
                     update_admin_panel(uid, f"✅ Timer: `{ivt}`",
                                        InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Auto BC", callback_data="adm_autobc_menu")))
                 except ValueError:
-                    update_admin_panel(uid, "❌ Invalid.",
-                                       InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Auto BC", callback_data="adm_autobc_menu")))
+                    pass
                 return
             if state == "WAITING_CUSTOM_BROADCAST":
                 user_states.pop(uid, None)
@@ -1380,8 +1344,7 @@ def handle_all_inputs(message):
                 update_admin_panel(uid, "✅ Restored.",
                                    InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Main", callback_data="adm_backup_menu")))
             except Exception as e:
-                update_admin_panel(uid, f"❌ Invalid JSON: {e}",
-                                   InlineKeyboardMarkup().row(InlineKeyboardButton("🔙 Back", callback_data="adm_backup_menu")))
+                pass
             return
 
 @app.route('/')
@@ -1396,24 +1359,22 @@ def webhook():
         return "!", 200
     return "Invalid message", 403
 
-@app.route('/<path:any_path>', methods=['POST'])
-def webhook_fallback(any_path):
-    return "Ignored", 200
-
 if __name__ == "__main__":
     for old_t in OLD_TOKENS:
         try:
-            r = requests.get(f"https://api.telegram.org/bot{old_t}/deleteWebhook?drop_pending_updates=true", timeout=10)
-            print(f"🧹 Old token cleanup: {old_t[:15]}... → HTTP {r.status_code}")
-        except Exception as e:
-            print(f"⚠️ {e}")
+            requests.get(f"https://api.telegram.org/bot{old_t}/deleteWebhook?drop_pending_updates=true", timeout=10)
+        except Exception:
+            pass
     time.sleep(2)
     try:
         bot.remove_webhook()
         time.sleep(1)
-        bot.set_webhook(url=f"{RENDER_URL}/{TOKEN}")
-        print(f"✅ Webhook set: {RENDER_URL}/{TOKEN[:15]}...")
+        # রেন্ডার ইউআরএলের শেষে অতিরিক্ত স্ল্যাশ ফিক্স করা হয়েছে
+        clean_url = RENDER_URL.rstrip('/')
+        bot.set_webhook(url=f"{clean_url}/{TOKEN}")
+        print(f"✅ Webhook set successfully!")
     except Exception as e:
         print(f"⚠️ Webhook error: {e}")
+        
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
