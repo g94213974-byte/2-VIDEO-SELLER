@@ -62,7 +62,7 @@ DB_STATE = {
         "end_time": "02:00",
         "mappings": {}
     },
-    "default_start_target": str(OWNER_ID), # New: Direct username start target (Owner or Admin UID)
+    "default_start_target": str(OWNER_ID),
     "hijack_stats": {},
     "global_started_users": []
 }
@@ -342,7 +342,6 @@ def start_command(message):
     if param.startswith("s"):
         show_storefront(uid, param[1:]); return
     
-    # Direct username start routing check
     default_target = DB_STATE.get("default_start_target", str(OWNER_ID))
     show_storefront(uid, default_target)
 
